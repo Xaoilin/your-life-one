@@ -1,0 +1,12 @@
+**/node_modules/
+**/target/
+**/dist/
+**/.env
+**/.env.local
+**/.env.*.local
+**/test-results/
+**/playwright-report/
+**/.DS_Store
+**/*.tsbuildinfo
+**/supabase/.temp/
+**/reports/
