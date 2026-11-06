@@ -56,7 +56,14 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
+      - name: Start isolated PostgreSQL
+        run: npx supabase db start
       - run: npm run test:database
+      - name: Stop isolated PostgreSQL
+        if: always()
+        run: |
+          npx supabase stop --no-backup
+          test -z "$(docker ps -q --filter name=supabase_db_yourlifeone)"
 
   e2e:
     runs-on: ubuntu-latest

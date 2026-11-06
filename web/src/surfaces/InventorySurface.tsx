@@ -207,7 +207,7 @@ function InventoryModal({ title, children, onClose }: { title: string; children:
       >
         <header className="inventory-modal-header">
           <div>
-            <div className="inventory-eyebrow">YOUR_LIFE ONE INVENTORY</div>
+            <div className="inventory-eyebrow">YOUR LIFE ONE INVENTORY</div>
             <h2>{title}</h2>
           </div>
           <button className="btn-icon" type="button" onClick={onClose} aria-label={`Close ${title}`}>&times;</button>
@@ -602,7 +602,7 @@ export default function InventorySurface() {
   return (
     <div className="surface inventory-surface">
       <header className="inventory-hero">
-        <div className="inventory-hero-copy"><div className="inventory-eyebrow">YOUR_LIFE ONE INVENTORY</div><h1>Know what you have before you buy.</h1><p>One account-backed catalogue for every project and every Partner planning conversation.</p></div>
+        <div className="inventory-hero-copy"><div className="inventory-eyebrow">YOUR LIFE ONE INVENTORY</div><h1>Know what you have before you buy.</h1><p>One account-backed catalogue for every project and every Partner planning conversation.</p></div>
         <div className="inventory-hero-actions"><button className="btn btn-secondary" onClick={() => setEditor({ kind: 'paste' })}>Paste and review</button><button className="btn btn-primary" onClick={() => setEditor({ kind: 'item' })}>+ Add owned item</button><button className="btn btn-secondary" onClick={() => setEditor({ kind: 'need' })}>+ Add need</button></div>
       </header>
       <section className="inventory-stats" aria-label="Inventory summary"><div><strong>{inventory.inventoryItems.filter(item => !item.archivedAt).length}</strong><span>Owned records</span></div><div><strong>{lowCount}</strong><span>Low stock</span></div><div><strong>{openNeedCount}</strong><span>Open needs</span></div></section>
@@ -634,7 +634,7 @@ export default function InventorySurface() {
             );
           })}
         </div>
-        {(view === 'owned' ? owned.length : needed.length) === 0 && <div className="inventory-empty"><div aria-hidden="true">S1</div><h3>{query || projectKey !== 'all' ? 'No matching records' : view === 'owned' ? 'Your catalogue is ready' : 'No needs recorded'}</h3><p>{query || projectKey !== 'all' ? 'Change the filters or add a new record.' : view === 'owned' ? 'Add a tool, machine, component, material, or consumable.' : 'Record requirements here before buying.'}</p></div>}
+        {(view === 'owned' ? owned.length : needed.length) === 0 && <div className="inventory-empty"><div aria-hidden="true">Y1</div><h3>{query || projectKey !== 'all' ? 'No matching records' : view === 'owned' ? 'Your catalogue is ready' : 'No needs recorded'}</h3><p>{query || projectKey !== 'all' ? 'Change the filters or add a new record.' : view === 'owned' ? 'Add a tool, machine, component, material, or consumable.' : 'Record requirements here before buying.'}</p></div>}
       </section>
       {editor?.kind === 'item' && <ItemEditor item={editor.item} projectCatalogKey={editor.projectCatalogKey} onClose={() => setEditor(null)} />}
       {editor?.kind === 'need' && <NeedEditor need={editor.need} linkedItem={editor.linkedItem} projectCatalogKey={editor.projectCatalogKey} onClose={() => setEditor(null)} />}

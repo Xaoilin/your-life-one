@@ -98,7 +98,7 @@ export default function OAuthConsentPage() {
   const requestedScope = details.scope.trim() || 'Account identity';
   return (
     <ConsentShell>
-      <div className="oauth-consent-client"><div aria-hidden="true">S1</div><span>wants to connect</span><strong>{details.client.name || 'Codex client'}</strong></div>
+      <div className="oauth-consent-client"><div aria-hidden="true">Y1</div><span>wants to connect</span><strong>{details.client.name || 'Codex client'}</strong></div>
       <h1>Choose access for this client</h1>
       <p className="oauth-consent-account">Signed in as {details.user.email || auth.authUser.email}</p>
       <fieldset className="oauth-consent-domains" disabled={busy !== null}>
@@ -155,7 +155,7 @@ function ConsentShell({ children }: { children: ReactNode }) {
   return (
     <main className="oauth-consent-page" tabIndex={0} aria-label="Client access approval">
       <section className="oauth-consent-card">
-        <div className="oauth-consent-brand"><span aria-hidden="true">S1</span><strong>YOUR_LIFE ONE</strong></div>
+        <div className="oauth-consent-brand"><span aria-hidden="true">Y1</span><strong>YOUR LIFE ONE</strong></div>
         {children}
       </section>
     </main>

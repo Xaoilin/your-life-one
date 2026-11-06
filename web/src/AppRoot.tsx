@@ -18,7 +18,7 @@ export function BootstrappedApp({ children }: { children?: ReactNode }) {
 
   if (!auth.bootstrapped) {
     return (
-      <OnlineGate eyebrow="YOUR_LIFE ONE" title="Loading your account" detail="Checking your secure Your Life One session..." />
+      <OnlineGate eyebrow="YOUR LIFE ONE" title="Loading your account" detail="Checking your secure Your Life One session..." />
     );
   }
 
@@ -107,7 +107,7 @@ function OnlineGate({ eyebrow, title, detail, actionLabel, onAction, error }: On
   return (
     <main className="online-gate">
       <section className="online-gate-card" aria-live="polite">
-        <div className="online-gate-mark" aria-hidden="true">S1</div>
+        <div className="online-gate-mark" aria-hidden="true">Y1</div>
         <div className="online-gate-eyebrow">{eyebrow}</div>
         <h1>{title}</h1>
         <p>{detail}</p>

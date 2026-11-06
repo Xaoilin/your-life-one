@@ -236,8 +236,8 @@ function AppInner() {
     <div className="app-layout">
       <nav className="sidebar" aria-label="Main navigation">
         <div className="sidebar-logo" role="banner" aria-label="Your Life One">
-          <span className="sidebar-monogram" aria-hidden="true">S1</span>
-          <span className="sidebar-wordmark">YOUR_LIFE ONE</span>
+          <span className="sidebar-monogram" aria-hidden="true">Y1</span>
+          <span className="sidebar-wordmark">YOUR LIFE ONE</span>
         </div>
         <div className="sidebar-nav" role="navigation">
           <QuickLinks variant="sidebar" />
