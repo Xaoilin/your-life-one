@@ -1,0 +1,155 @@
+export function parseGitHubRemoteUrl(remoteUrl) {
+  const normalized = remoteUrl.trim()
+  const sshMatch = normalized.match(/^git@github\.com:(?<owner>[^/]+)\/(?<repo>.+?)(?:\.git)?$/)
+  if (sshMatch?.groups) {
+    return {
+      owner: sshMatch.groups.owner,
+      repo: sshMatch.groups.repo,
+    }
+  }
+
+  const httpsMatch = normalized.match(/^https:\/\/github\.com\/(?<owner>[^/]+)\/(?<repo>.+?)(?:\.git)?$/)
+  if (httpsMatch?.groups) {
+    return {
+      owner: httpsMatch.groups.owner,
+      repo: httpsMatch.groups.repo,
+    }
+  }
+
+  throw new Error(`Unsupported GitHub remote URL: ${remoteUrl}`)
+}
+
+export function buildGitHubPagesUrl({ owner, repo }) {
+  return `https://${owner.toLowerCase()}.github.io/${repo}/`
+}
+
+export async function findVersionedJavaScriptAsset({
+  fetchAsset,
+  html,
+  pagesUrl,
+  version,
+}) {
+  const assetUrls = [...new Set(
+    [...html.matchAll(/(?:src|href)=["']([^"']*assets\/[^"']+\.js(?:\?[^"']*)?)["']/giu)]
+      .map((match) => new URL(match[1], pagesUrl).toString()),
+  )]
+
+  if (assetUrls.length === 0) {
+    throw new Error(`Could not find built JavaScript assets in ${pagesUrl}.`)
+  }
+
+  for (const assetUrl of assetUrls) {
+    const bundle = await fetchAsset(assetUrl)
+    if (bundle.includes(version)) {
+      return { assetUrl, bundle }
+    }
+  }
+
+  return { assetUrl: null, bundle: '' }
+}
+
+export function parseBranchList(rawOutput) {
+  return rawOutput
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
+
+export function parseStatusPaths(rawOutput) {
+  return rawOutput
+    .split(/\r?\n/u)
+    .map((line) => {
+      if (!line.trim()) {
+        return null
+      }
+
+      const pathSegment = line.slice(3)
+      const renamedParts = pathSegment.split(' -> ')
+      return renamedParts[renamedParts.length - 1]?.trim() ?? null
+    })
+    .filter(Boolean)
+}
+
+export function isIgnoredWorkingTreePath(path) {
+  return (
+    path.startsWith('.codex/') ||
+    path.startsWith('supabase/.temp/') ||
+    path.startsWith('test-results/')
+  )
+}
+
+export function findSuccessfulRunForHead(runs, headSha) {
+  const latest = findLatestWorkflowRun(runs.filter(run => run.headSha === headSha))
+  return latest?.status === 'completed' && latest.conclusion === 'success' ? latest : null
+}
+
+export function evaluateHandoffVerification(state) {
+  const failures = []
+  const passes = []
+
+  if (state.blockingWorkingTreeChanges.length > 0) {
+    failures.push(
+      `Working tree still has uncommitted non-generated changes: ${state.blockingWorkingTreeChanges.join(', ')}.`,
+    )
+  } else {
+    passes.push('No uncommitted non-generated working tree changes remain.')
+  }
+
+  if (!state.isHeadMergedIntoMaster) {
+    failures.push(
+      `Current HEAD ${state.currentHead.slice(0, 7)} is not merged into origin/master ${state.masterHead.slice(0, 7)}.`,
+    )
+  } else {
+    passes.push(`Current HEAD is merged into origin/master at ${state.masterHead.slice(0, 7)}.`)
+  }
+
+  if (!state.ciRun) {
+    failures.push(`No successful CI run was found for origin/master at ${state.masterHead.slice(0, 7)}.`)
+  } else {
+    passes.push(`CI passed for origin/master: ${state.ciRun.url}`)
+  }
+
+  if (!state.deploymentRun) {
+    failures.push(`No successful DigitalOcean deployment was found for origin/master at ${state.masterHead.slice(0, 7)}.`)
+  } else {
+    passes.push(`DigitalOcean deployment passed: ${state.deploymentRun.url}`)
+  }
+
+  if (!state.nativeIdentityReady) {
+    failures.push('The native YourLife identity issuer is not live.')
+  } else {
+    passes.push('The native YourLife identity issuer is live.')
+  }
+  if (state.deploymentReceipt?.repository !== 'example-developer/yourlifeone' || state.deploymentReceipt.commit !== state.masterHead) {
+    failures.push('The served frontend source receipt does not match origin/master.')
+  } else {
+    passes.push('The served frontend source receipt matches origin/master.')
+  }
+
+  if (!state.liveSiteContainsVersion) {
+    failures.push(
+      `The live site at ${state.pagesUrl} is not serving version ${state.version} from ${state.assetUrl ?? 'its current bundle'}.`,
+    )
+  } else {
+    passes.push(`Live site bundle ${state.assetUrl} contains version ${state.version}.`)
+  }
+
+  if (state.mergedLocalTopicBranches.length > 0) {
+    failures.push(`Merged local topic branches still exist: ${state.mergedLocalTopicBranches.join(', ')}.`)
+  } else {
+    passes.push('No merged local codex branches remain.')
+  }
+
+  if (state.mergedRemoteTopicBranches.length > 0) {
+    failures.push(`Merged remote topic branches still exist: ${state.mergedRemoteTopicBranches.join(', ')}.`)
+  } else {
+    passes.push('No merged remote codex branches remain.')
+  }
+
+  return {
+    failures,
+    passes,
+    ok: failures.length === 0,
+  }
+}
+import { findLatestWorkflowRun } from './ciReceipt.mjs'

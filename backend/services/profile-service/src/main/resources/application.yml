@@ -1,0 +1,212 @@
+server:
+  port: ${PORT:8080}
+
+spring:
+  application:
+    name: profile-service
+  datasource:
+    # SPRING_DATASOURCE_URL, _USERNAME and _PASSWORD are required at runtime.
+    hikari:
+      maximum-pool-size: 2
+      minimum-idle: ${APP_DATASOURCE_MINIMUM_IDLE:1}
+      # Opening a TLS connection through the Supabase pooler can take a few seconds.
+      connection-timeout: ${APP_DATASOURCE_CONNECTION_TIMEOUT_MS:8000}
+      # Keep one connection warm and validate it with keepalive. Avoid reopening TLS connections
+      # every five minutes; the bounded pool still replaces stale or broken connections.
+      keepalive-time: 60000
+      idle-timeout: 120000
+      max-lifetime: ${APP_DATASOURCE_MAX_LIFETIME_MS:1800000}
+      validation-timeout: 250
+      # Start even when the database is unreachable; health reports DOWN until it returns.
+      initialization-fail-timeout: -1
+      data-source-properties:
+        sslmode: ${APP_DATASOURCE_SSLMODE:require}
+  rabbitmq:
+    template:
+      observation-enabled: true
+    listener:
+      simple:
+        observation-enabled: true
+    # SPRING_RABBITMQ_HOST, _USERNAME and _PASSWORD are set by the deploy.
+    connection-timeout: 2s
+  jpa:
+    open-in-view: false
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    properties:
+      # Do not contact the database while starting.
+      hibernate.boot.allow_jdbc_metadata_access: false
+
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+    export:
+      enabled: ${GRAFANA_TRACING_ENABLED:false}
+  opentelemetry:
+    tracing:
+      export:
+        max-queue-size: 512
+        max-batch-size: 128
+        timeout: 3s
+        schedule-delay: 5s
+        otlp:
+          endpoint: ${GRAFANA_OTLP_TRACES_URL:http://127.0.0.1:4318/v1/traces}
+          connect-timeout: 1s
+          timeout: 3s
+      limits:
+        max-attributes: 32
+        max-attribute-value-length: 128
+        max-events: 4
+        max-links: 4
+        max-attributes-per-event: 4
+        max-attributes-per-link: 4
+    resource-attributes:
+      "service.instance.id": ${APP_SERVICE_INSTANCE_ID:local}
+      "deployment.environment.name": ${APP_ENVIRONMENT:production}
+  endpoints:
+    access:
+      # No actuator endpoint is served over HTTP; metrics are pushed to Grafana Cloud.
+      default: none
+  metrics:
+    tags:
+      service: profile-service
+      instance: ${APP_SERVICE_INSTANCE_ID:local}
+    distribution:
+      slo:
+        "[http.server.requests]": 100ms,300ms,1s,3s,10s
+        "[http.client.requests]": 100ms,300ms,1s,3s,10s
+      percentiles:
+        "[http.server.requests]": 0.5, 0.95, 0.99
+        # Operational events reported by the React app (see OperationalEventRecorder).
+        "[yourlife.client.event.duration]": 0.5, 0.95, 0.99
+        "[yourlife.client.recovery.duration]": 0.5, 0.95, 0.99
+    data:
+      repository:
+        autotime:
+          # How long each database repository call takes.
+          percentiles: 0.5, 0.95, 0.99
+  otlp:
+    metrics:
+      export:
+        # Pushed to Grafana Cloud's OTLP gateway once a minute; off unless the deploy provides a token.
+        enabled: ${GRAFANA_METRICS_ENABLED:false}
+        url: ${GRAFANA_OTLP_METRICS_URL:http://localhost:4318/v1/metrics}
+        headers:
+          Authorization: ${GRAFANA_OTLP_AUTHORIZATION:}
+        step: 1m
+        connect-timeout: 1s
+        read-timeout: 3s
+
+app:
+  write-commands:
+    queue: yourlife.profile.commands
+    processed-table: profile.processed_command
+    # The React app gives up after 10 seconds; answer before it does.
+    reply-timeout: 8s
+    # One write at a time keeps the second database connection free for reads.
+    consumers: 1
+    # Processed writes are remembered this long (a retry within it is applied once), then deleted.
+    retention: 30d
+  cors:
+    allowed-origins: ${APP_CORS_ALLOWED_ORIGINS:http://localhost:5173,https://your-life-one.example}
+  auth:
+    # Public Supabase project URL; access tokens are verified against its JWKS.
+    supabase-url: ${SUPABASE_URL:https://example-project.supabase.co}
+  rate-limit:
+    # Per signed-in user: this many requests at once, refilled at requests-per-minute.
+    requests-per-minute: ${APP_RATE_LIMIT_PER_MINUTE:120}
+    burst: ${APP_RATE_LIMIT_BURST:60}
+  profile:
+    default-city: Bedford
+    default-country: United Kingdom
+    view-preferences:
+      allowed-values:
+        "[prayerChallenge.period]": ["day", "week", "month"]
+        "[dashboard.learnIndividualSteps]": ["true", "false"]
+        "[dashboard.moveIndividualSteps]": ["true", "false"]
+        "[dashboard.showPrayerLog]": ["true", "false"]
+        "[dashboard.inspirationSource]": ["quran", "books", "driving"]
+        "[calendar.view]": ["month", "week", "agenda", "accounts"]
+        "[tasks.tab]": ["today", "all", "goals"]
+        "[tasks.showCompletedGoals]": ["true", "false"]
+        "[tasks.category]": ["all", "daily", "prayer", "task"]
+        "[tasks.priority]": ["all", "low", "medium", "high"]
+        "[tasks.status]": ["all", "active", "completed"]
+        "[knowledge.tab]": ["browse", "add", "search", "lifestyle"]
+        "[knowledge.sourceFilter]": ["all", "quran", "hadith", "scholarly", "other"]
+        "[knowledge.searchSourceFilter]": ["all", "quran", "hadith", "scholarly", "other"]
+        "[employment.activeOnly]": ["true", "false"]
+        "[employment.showFilters]": ["true", "false"]
+        "[employment.status]": ["all", "lead", "recruiter", "applied", "interview", "offer", "closed"]
+        "[employment.workType]": ["all", "contract", "permanent", "unknown"]
+        "[employment.remoteStatus]": ["all", "confirmed", "needs_verification"]
+        "[finance.tab]": ["overview", "spending", "loans", "transactions", "accounts", "budgets", "stocks", "options"]
+        "[finance.filterType]": ["all", "income", "expense", "transfer"]
+        "[inventory.view]": ["owned", "needed"]
+        "[inventory.category]": ["all", "machine", "tool", "electronics", "component", "material", "consumable", "fastener", "safety", "storage", "other"]
+        "[secrets.kindFilter]": ["all", "password", "api_key", "access_token", "database", "private_key", "webhook", "other"]
+        "[secrets.showArchived]": ["true", "false"]
+        "[trips.tab]": ["overview", "timeline", "bookings", "budget"]
+        "[projects.tab]": ["overview", "board", "milestones", "inventory", "wiki"]
+        "[debug.tab]": ["network", "prayer", "operations"]
+        "[activity.rangeDays]": ["7", "30", "90"]
+        "[activity.kind]": ["all", "session", "navigation", "action", "outcome", "error", "performance"]
+        "[activity.surface]": ["all", "dashboard", "chat", "calendar", "clock", "trips", "projects", "inventory", "secrets", "tasks", "employment", "finance", "health", "knowledge", "profile", "integrations", "activity", "settings", "debug"]
+        "[activity.outcome]": ["all", "success", "failure", "cancelled", "unavailable"]
+    preferences:
+      themes: dark, light
+      default-theme: dark
+      calendar-tabs: month, week, agenda, accounts
+      min-data-retention-days: 7
+      max-data-retention-days: 365
+      default-data-retention-days: 90
+      max-goal-tags: 50
+      max-goal-tag-length: 60
+    integrations:
+      providers: google
+    # Content-free product-usage events from the React app (the Activity page).
+    activity:
+      ingest:
+        schema-version: 1
+        max-batch: 25
+        max-sequence: 1000000
+        max-duration-ms: 1800000
+        kinds: session, navigation, action, outcome, error, performance
+        surfaces: >-
+          dashboard, chat, calendar, clock, trips, projects, software, inventory, secrets, tasks, employment, finance,
+          health, knowledge, profile, integrations, activity, settings, debug
+        outcomes: success, failure, cancelled, unavailable
+        device-classes: mobile, tablet, desktop
+        input-kinds: pointer, keyboard, voice, assistant, system
+        metadata-keys: previousSurface, navigationSource, viewportBucket, visibilityState, retryCount
+        max-metadata-bytes: 2048
+        max-metadata-string-length: 96
+        taxonomy-pattern: '[a-z][a-z0-9_]{0,63}'
+        error-code-pattern: '[a-z][a-z0-9_:-]{0,63}'
+        target-pattern: '[a-z][a-z0-9_:-]{0,95}'
+        release-pattern: '[0-9]+\.[0-9]+\.[0-9]+([+-][a-zA-Z0-9.-]+)?'
+        max-release-length: 32
+      insights:
+        range-days: 7, 30, 90
+        default-range-days: 30
+        max-trends: 8
+        max-errors: 8
+        max-recommendations: 3
+  telemetry:
+    # Events older than this, or further ahead than max-clock-skew, are refused.
+    max-event-age: 1h
+    max-clock-skew: 1m
+
+logging:
+  structured:
+    format:
+      console: ecs
+
+jdbc:
+  includes: QUERY
+  datasource-proxy:
+    include-parameter-values: false
+    query:
+      enable-logging: false
+    slow-query:
+      enable-logging: false

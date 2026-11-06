@@ -1,0 +1,156 @@
+import { execFileSync, spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import {
+  evaluateHandoffVerification,
+  findVersionedJavaScriptAsset,
+  findSuccessfulRunForHead,
+  isIgnoredWorkingTreePath,
+  parseBranchList,
+  parseGitHubRemoteUrl,
+  parseStatusPaths,
+} from './lib/handoffVerification.mjs'
+
+const packageJson = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+)
+
+function run(command, args) {
+  const output = execFileSync(command, args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  return output.replace(/(?:\r?\n)+$/u, '')
+}
+
+function runStatus(command, args) {
+  const result = spawnSync(command, args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  return {
+    status: result.status ?? 1,
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+  }
+}
+
+function runJson(command, args) {
+  return JSON.parse(run(command, args))
+}
+
+function loadRunsForHead(repository, workflow, headSha) {
+  const pages = runJson('gh', [
+    'api', `repos/${repository}/actions/workflows/${workflow}/runs?branch=master&head_sha=${headSha}&per_page=100`,
+    '--paginate', '--slurp',
+  ])
+  return pages.flatMap(page => page.workflow_runs).map(run => ({
+    ...run,
+    databaseId: run.id,
+    headSha: run.head_sha,
+    startedAt: run.run_started_at,
+    url: run.html_url,
+  }))
+}
+
+async function fetchText(url) {
+  const response = await fetch(url)
+  if (!response.ok) {
+    throw new Error(`Request to ${url} failed with ${response.status}.`)
+  }
+  return response.text()
+}
+
+async function fetchLiveBundleVersionState(pagesUrl, version) {
+  const html = await fetchText(pagesUrl)
+  return findVersionedJavaScriptAsset({
+    fetchAsset: fetchText,
+    html,
+    pagesUrl,
+    version,
+  })
+}
+
+async function main() {
+  const version = packageJson.version
+  const remoteUrl = run('git', ['remote', 'get-url', 'origin'])
+  const currentHead = run('git', ['rev-parse', 'HEAD'])
+  const masterHead = run('git', ['rev-parse', 'origin/master'])
+  const remote = parseGitHubRemoteUrl(remoteUrl)
+  const pagesUrl = 'https://your-life-one.example/yourlifeone/'
+  const currentBranch = run('git', ['branch', '--show-current']) || '(detached HEAD)'
+  const isHeadMergedIntoMaster = runStatus('git', ['merge-base', '--is-ancestor', 'HEAD', 'origin/master']).status === 0
+  const blockingWorkingTreeChanges = parseStatusPaths(
+    run('git', ['status', '--short', '--untracked-files=all']),
+  ).filter((path) => !isIgnoredWorkingTreePath(path))
+
+  const mergedLocalTopicBranches = parseBranchList(
+    run('git', ['branch', '--format=%(refname:short)', '--merged', 'origin/master']),
+  ).filter((branch) => branch.startsWith('codex/'))
+
+  const mergedRemoteTopicBranches = parseBranchList(
+    run('git', ['branch', '-r', '--format=%(refname:short)', '--merged', 'origin/master']),
+  ).filter((branch) => branch.startsWith('origin/codex/'))
+
+  const repository = `${remote.owner}/${remote.repo}`
+  const ciRuns = loadRunsForHead(repository, 'ci.yml', masterHead)
+  const deploymentRuns = loadRunsForHead(repository, 'deploy.yml', masterHead)
+
+  const ciRun = findSuccessfulRunForHead(ciRuns, masterHead)
+  const deploymentRun = findSuccessfulRunForHead(deploymentRuns, masterHead)
+  const nativeMetadata = await fetch('https://your-life-one.example/.well-known/oauth-authorization-server/api/access', { signal: AbortSignal.timeout(15000) })
+  const nativeIdentityReady = nativeMetadata.ok && (await nativeMetadata.json()).issuer === 'https://your-life-one.example/api/access'
+  const deployed = await fetch(new URL('deployment.json', pagesUrl), { signal: AbortSignal.timeout(15000) })
+  const deploymentReceipt = deployed.ok ? await deployed.json() : null
+
+  let assetUrl = null
+  let liveSiteContainsVersion = false
+
+  try {
+    const liveBundle = await fetchLiveBundleVersionState(pagesUrl, version)
+    assetUrl = liveBundle.assetUrl
+    liveSiteContainsVersion = liveBundle.bundle.includes(version)
+  } catch (error) {
+    console.error(`Failed to verify the live site bundle: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  const result = evaluateHandoffVerification({
+    assetUrl,
+    blockingWorkingTreeChanges,
+    ciRun,
+    currentBranch,
+    currentHead,
+    isHeadMergedIntoMaster,
+    liveSiteContainsVersion,
+    masterHead,
+    mergedLocalTopicBranches,
+    mergedRemoteTopicBranches,
+    deploymentRun,
+    pagesUrl,
+    nativeIdentityReady,
+    deploymentReceipt,
+    version,
+  })
+
+  console.log(`handoff:check for ${currentBranch}`)
+  console.log(`version: ${version}`)
+  console.log(`origin/master: ${masterHead}`)
+  console.log(`live site: ${pagesUrl}`)
+  console.log('')
+
+  for (const pass of result.passes) {
+    console.log(`PASS ${pass}`)
+  }
+
+  for (const failure of result.failures) {
+    console.error(`FAIL ${failure}`)
+  }
+
+  if (!result.ok) {
+    process.exitCode = 1
+  }
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error))
+  process.exitCode = 1
+})

@@ -1,0 +1,120 @@
+import type { Page } from '@playwright/test';
+import { expect, openApp, test, waitForMutation } from './support/yourlifeone-fixture';
+
+function requestedViewports(): string[] {
+  return (process.env.YOUR_LIFE_ONE_E2E_VISUAL_VIEWPORTS || '390x844,1440x900')
+    .split(',')
+    .map(value => value.trim())
+    .filter(value => /^\d+x\d+$/u.test(value));
+}
+
+async function addReadingPage(page: Page): Promise<void> {
+  const reading = page.locator('[data-template-id="learn-reading"]');
+  const addPage = reading.getByRole('button', { name: 'Add 1 page' });
+  await expect(addPage).toBeEnabled();
+  const mutation = waitForMutation(page, 'gamification');
+  await addPage.click();
+  await mutation;
+}
+
+async function expectCornerReceipt(page: Page): Promise<void> {
+  const receipt = page.locator('.milestone-celebration');
+  const geometry = await receipt.evaluate(element => {
+    const rect = element.getBoundingClientRect();
+    return {
+      top: rect.top,
+      rightGap: window.innerWidth - rect.right,
+      left: rect.left,
+      bottom: rect.bottom,
+      height: rect.height,
+      viewportHeight: window.innerHeight,
+    };
+  });
+  expect(geometry.top).toBeGreaterThanOrEqual(12);
+  expect(geometry.top).toBeLessThanOrEqual(24);
+  expect(geometry.rightGap).toBeGreaterThanOrEqual(12);
+  expect(geometry.rightGap).toBeLessThanOrEqual(24);
+  expect(geometry.left).toBeGreaterThanOrEqual(12);
+  expect(geometry.height).toBeLessThanOrEqual(180);
+  expect(geometry.bottom).toBeLessThan(geometry.viewportHeight / 2);
+  await expect(receipt).toHaveCSS('pointer-events', 'none');
+  await expect(page.locator('.milestone-celebration-glow')).toHaveCount(0);
+}
+
+for (const viewport of requestedViewports()) {
+  test(`renders a restrained Reading L1 receipt at ${viewport} @visual`, async ({ page, scenario }, testInfo) => {
+    test.skip(
+      Boolean(process.env.YOUR_LIFE_ONE_E2E_VISUAL_SURFACE && process.env.YOUR_LIFE_ONE_E2E_VISUAL_SURFACE !== 'milestone'),
+      'A different visual surface was requested.',
+    );
+
+    const [width, height] = viewport.split('x').map(Number);
+    await page.setViewportSize({ width, height });
+    if (width <= 390) await page.emulateMedia({ reducedMotion: 'reduce' });
+    await scenario({
+      now: '2026-08-29T12:30:00.000Z',
+      settings: { prayerEnabled: true },
+    });
+    await openApp(page);
+
+    await page.getByRole('region', { name: 'Learn', exact: true })
+      .getByRole('switch', { name: 'Add individual steps' }).click();
+
+    await addReadingPage(page);
+    await expect(page.locator('[data-template-id="learn-reading"]')).toContainText('1 / 2 pages');
+    await expect(page.getByRole('status').filter({ hasText: 'Reading · Level 1' })).toHaveCount(0);
+
+    await addReadingPage(page);
+    const celebration = page.getByRole('status').filter({ hasText: 'Reading · Level 1' });
+    await expect(celebration).toBeVisible();
+    await expect(celebration).toContainText("Today's target is complete.");
+    await expect(celebration).toHaveCSS('pointer-events', 'none');
+    await expect(celebration.getByLabel('Level 1 of 5')).toBeVisible();
+
+    await expectCornerReceipt(page);
+
+    const geometry = await celebration.locator('.milestone-celebration-card').evaluate(element => {
+      const rect = element.getBoundingClientRect();
+      return { top: rect.top, right: rect.right, bottom: rect.bottom, left: rect.left };
+    });
+    expect(geometry.left).toBeGreaterThanOrEqual(0);
+    expect(geometry.top).toBeGreaterThanOrEqual(0);
+    expect(geometry.right).toBeLessThanOrEqual(width);
+    expect(geometry.bottom).toBeLessThanOrEqual(height);
+
+    if (width <= 390) {
+      await expect(celebration).toHaveCSS('animation-name', 'none');
+      await expect(celebration.locator('.milestone-celebration-mark > i').first()).toHaveCSS('display', 'none');
+    } else {
+      await page.waitForTimeout(450);
+    }
+
+    await page.screenshot({ path: testInfo.outputPath(`reading-level-one-${viewport}.png`) });
+  });
+}
+
+test('renders a dignified prayer completion receipt @visual', async ({ page, scenario }, testInfo) => {
+  test.skip(
+    Boolean(process.env.YOUR_LIFE_ONE_E2E_VISUAL_SURFACE && process.env.YOUR_LIFE_ONE_E2E_VISUAL_SURFACE !== 'milestone'),
+    'A different visual surface was requested.',
+  );
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await scenario({
+    now: '2026-08-29T12:30:00.000Z',
+    settings: { prayerEnabled: true },
+  });
+  await openApp(page);
+
+  await page.getByRole('button', { name: /Complete Dhuhr Prayer — Current prayer/u }).click();
+  await expect(page.getByRole('dialog', { name: 'When did you pray Dhuhr?' })).toBeVisible();
+  await page.getByRole('button', { name: /Prayed within the time window/u }).click();
+
+  const celebration = page.getByRole('status').filter({ hasText: 'Dhuhr complete' });
+  await expect(celebration).toBeVisible();
+  await expect(celebration).toContainText('Prayer kept on time');
+  await expect(celebration).toHaveCSS('pointer-events', 'none');
+  await expectCornerReceipt(page);
+  await page.waitForTimeout(450);
+  await page.screenshot({ path: testInfo.outputPath('prayer-completion-1440x900.png') });
+});

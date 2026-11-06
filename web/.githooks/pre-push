@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+echo "Running the single YOUR_LIFE_ONE full gate..."
+npm run check

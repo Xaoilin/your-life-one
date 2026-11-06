@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+echo "Checking staged YOUR_LIFE_ONE changes..."
+git diff --cached --check

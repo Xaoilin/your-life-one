@@ -1,0 +1,287 @@
+import { createClient, type SupabaseClient } from 'npm:@supabase/supabase-js@2.100.1';
+import { createMcpHandler, McpServer, type AuthInfo } from 'npm:@modelcontextprotocol/server@2.0.0';
+import { z } from 'npm:zod@4.4.3';
+import { ASSISTANT_DEPLOY_SHA } from '../_shared/assistantDeployment.ts';
+import { callFinance, probeFinanceAccess, toolFailure, toolResult } from '../_shared/financeService.ts';
+
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL') || '';
+const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY') || '';
+const FUNCTION_BASE_URL = `${SUPABASE_URL}/functions/v1/your-life-one-finance-mcp`;
+const RESOURCE_URL = `${FUNCTION_BASE_URL}/mcp`;
+const RESOURCE_METADATA_URL = `${FUNCTION_BASE_URL}/.well-known/oauth-protected-resource`;
+const ALLOWED_ORIGINS = new Set(
+  (Deno.env.get('YOUR_LIFE_ONE_MCP_ALLOWED_ORIGINS') || [
+    'https://your-life-one.example', 'http://localhost:5173', 'http://localhost:5174',
+  ].join(',')).split(',').map(origin => origin.trim()).filter(Boolean),
+);
+
+const idSchema = z.string().trim().min(1).max(256);
+const requestIdSchema = z.uuid().describe(
+  'Required idempotency key. Reuse the same UUID and exact input when retrying a write; use a new UUID for a new change.',
+);
+const dateSchema = z.iso.date().refine(value => !value.startsWith('0000-'), 'Calendar years must be 0001 or later.');
+const monthSchema = z.string().regex(/^(?!0000)\d{4}-(0[1-9]|1[0-2])$/);
+const textSchema = z.string().max(4_000);
+const labelSchema = textSchema.trim().min(1);
+const signedPence = z.number().int().min(-1_000_000_000_000).max(1_000_000_000_000);
+const pence = signedPence.nonnegative();
+const count = z.number().int().min(0).max(10_000_000);
+const urlSchema = z.string().max(2_048).refine(value => {
+  try {
+    const url = new URL(value);
+    return /^https?:\/\/[^\s/?#]+[^\s]*$/.test(value) && !value.includes('\\') && Boolean(url.hostname) && !url.username && !url.password;
+  } catch { return false; }
+}, 'Use an HTTP or HTTPS source URL without embedded credentials.');
+const sourceSchema = z.object({ id: idSchema, label: labelSchema, url: urlSchema, asOf: dateSchema }).strict();
+const loanSchema = z.object({
+  id: idSchema, lender: labelSchema, purpose: textSchema, status: z.enum(['active', 'repaid', 'closed']),
+  monthlyPaymentPence: pence.optional(), userSharePence: pence.optional(), balancePence: pence.optional(), balanceAsOf: dateSchema.optional(),
+  balanceKind: z.enum(['statement', 'settlement', 'estimate', 'unknown']),
+  startDate: dateSchema.optional(), endDate: dateSchema.optional(), aprPercent: z.number().min(0).max(1000).optional(),
+  settlementPence: pence.optional(), settlementAsOf: dateSchema.optional(), nextPaymentDate: dateSchema.optional(),
+  paymentsRemaining: count.optional(), originalPrincipalPence: pence.optional(),
+  rateNote: textSchema, notes: textSchema, sourceIds: z.array(idSchema).max(100),
+}).strict().refine(value => (value.balancePence === undefined) === (value.balanceAsOf === undefined)
+  && (value.settlementPence === undefined) === (value.settlementAsOf === undefined), 'Balances and settlements require their own dates.')
+  .refine(value => !value.startDate || !value.endDate || value.startDate <= value.endDate, 'Loan end precedes its start.');
+const monthReviewSchema = z.object({
+  month: monthSchema, incomePence: pence, outflowPence: pence, netPence: signedPence, salaryPence: pence,
+  categories: z.array(z.object({ label: labelSchema, amountPence: signedPence }).strict()).max(100),
+}).strict().refine(value => value.incomePence - value.outflowPence === value.netPence, 'Monthly net must equal income minus outflow.');
+const uniqueIds = (entries: { id: string }[]) => new Set(entries.map(entry => entry.id)).size === entries.length;
+const MAX_EXPENSE_GROUPS = 500;
+const MAX_FORECAST_ITEMS = 200;
+const budgetForecastSchema = z.object({
+  baselineMonth: monthSchema,
+  incomePence: pence.nullable().optional(),
+  incomeBasis: textSchema.nullable().optional(),
+  items: z.array(z.object({
+    id: idSchema, label: labelSchema, amountPence: pence,
+    group: z.enum(['non-discretionary', 'necessary', 'discretionary']),
+  }).strict()).max(MAX_FORECAST_ITEMS).refine(uniqueIds, 'Duplicate forecast item IDs.'),
+}).strict();
+const reviewTransactionsSchema = z.array(z.object({
+  id: idSchema, accountId: idSchema, month: monthSchema, date: dateSchema.nullable().optional(),
+  merchant: labelSchema, description: textSchema, category: labelSchema,
+  amountPence: signedPence.refine(value => value !== 0, 'A payment cannot be zero.'),
+  detail: textSchema.nullable().optional(), recurrence: z.enum(['recurring', 'one-off', 'unknown']).nullable().optional(),
+  sourceIds: z.array(idSchema).max(100).nullable().optional(), origin: z.enum(['bank', 'user']),
+}).strict().refine(value => !value.date || value.date.slice(0, 7) === value.month, 'Payment date must match its month.')
+  .refine(value => value.origin !== 'bank' || Boolean(value.date && value.sourceIds?.length), 'Bank payments require a date and source.'))
+  .max(5000).refine(uniqueIds, 'Duplicate payment IDs.');
+const expenseGroupsSchema = z.array(z.object({
+  label: labelSchema, group: z.enum(['non-discretionary', 'necessary', 'discretionary']),
+}).strict()).max(MAX_EXPENSE_GROUPS).refine(entries =>
+  new Set(entries.map(entry => entry.label.trim().toLowerCase())).size === entries.length, 'Duplicate expense group labels.');
+const profileLoanSchema = z.object({
+  loanId: idSchema, balancePence: pence, annualRatePercent: z.number().min(0).max(100),
+  monthlyPaymentPence: pence, monthlyExtraPence: pence, lumpSumPence: pence,
+  extraStartsAfterMonths: z.number().int().min(0).max(1199), sharePercent: z.number().min(0).max(100),
+  matchExtra: z.boolean(), repaymentMode: z.enum(['shorten-term', 'reduce-payment']), balanceAsOf: dateSchema.nullable().optional(),
+}).strict().refine(value => value.balancePence === 0 || value.monthlyPaymentPence > 0, 'A positive loan balance needs a positive monthly payment.');
+const profileSchema = z.object({
+  id: idSchema, name: z.string().trim().min(1).max(128), isDefault: z.boolean(), firstPaymentMonth: monthSchema,
+  selectedLoanId: idSchema.nullable().optional(), showShare: z.boolean(), reviewAsOf: dateSchema,
+  loans: z.array(profileLoanSchema).min(1).max(50),
+}).strict().refine(value => new Set(value.loans.map(loan => loan.loanId)).size === value.loans.length, 'Duplicate profile loan IDs.')
+  .refine(value => !value.selectedLoanId || value.loans.some(loan => loan.loanId === value.selectedLoanId), 'The selected loan must be in the profile.');
+const profilesSchema = z.array(profileSchema).max(20).refine(uniqueIds, 'Duplicate loan profile IDs.')
+  .refine(profiles => profiles.filter(profile => profile.isDefault).length <= 1, 'Only one loan profile can be the default.');
+const draftSchema = z.object({
+  asOf: dateSchema, currency: z.literal('GBP'),
+  coverage: z.object({ from: dateSchema, to: dateSchema, completeThrough: monthSchema, transactionCount: count, accountCount: count, note: textSchema }).strict()
+    .refine(value => value.from <= value.to && value.completeThrough <= value.to.slice(0, 7), 'Coverage dates are inconsistent.'),
+  accounts: z.array(z.object({ id: idSchema, label: labelSchema, ownership: z.enum(['personal', 'household']), balancePence: signedPence, asOf: dateSchema }).strict()).max(50).refine(uniqueIds, 'Duplicate account IDs.'),
+  months: z.array(monthReviewSchema).max(120).refine(entries => new Set(entries.map(entry => entry.month)).size === entries.length, 'Duplicate months.'),
+  expenseGroups: expenseGroupsSchema.optional().describe('Saved category choices across all months. Preserve these when refreshing bank history; omit to retain existing choices, or [] to clear them.'),
+  budgetForecast: budgetForecastSchema.nullable().optional().describe('Editable monthly forecast, separate from historical spending. Missing/null preserves the saved plan; an explicit empty items list saves an empty plan.'),
+  transactions: reviewTransactionsSchema.nullable().optional().describe('Itemised personal spending: positive debit amounts, negative refunds. Preserve bank descriptions; add only verified purpose, recurrence and receipt sources. No joint-account itemisation. Missing/null preserves existing rows; [] clears.'),
+  budget: z.object({ incomePence: pence, incomeBasis: textSchema,
+    essentials: z.array(z.object({ label: labelSchema, amountPence: pence, note: textSchema }).strict()).max(100),
+    workCostsPence: pence, workCostsNote: textSchema,
+    scenarios: z.array(z.object({ label: labelSchema, status: z.enum(['planned', 'confirmed']), monthlyAdjustmentPence: signedPence, note: textSchema }).strict()).max(50),
+  }).strict(),
+  opportunities: z.array(z.object({ label: labelSchema, monthlyPence: pence, note: textSchema, suggestedCapPence: pence.optional() }).strict()).max(100),
+  loans: z.array(loanSchema).max(50).refine(uniqueIds, 'Duplicate loan IDs.'), notes: z.array(textSchema).max(100),
+  loanProfiles: profilesSchema.nullable().optional(),
+  sources: z.array(sourceSchema).max(100).refine(uniqueIds, 'Duplicate source IDs.'),
+}).strict().refine(value => new TextEncoder().encode(JSON.stringify(value, null, 1)).byteLength <= 262_144, 'Finance input must fit within 256 KiB.')
+  .refine(value => value.loans.every(loan => loan.sourceIds.every(id => value.sources.some(source => source.id === id))), 'Loan references an unknown source.')
+  .refine(value => !value.loanProfiles || value.loanProfiles.every(profile => profile.loans.every(item => value.loans.some(loan => loan.id === item.loanId))), 'Loan profile references an unknown loan.')
+  .refine(value => !value.transactions || value.transactions.every(item => value.accounts.some(account => account.id === item.accountId && account.ownership === 'personal')), 'Payment must reference a personal account.')
+  .refine(value => !value.transactions || value.transactions.every(item => (item.sourceIds ?? []).every(id => value.sources.some(source => source.id === id))), 'Payment references an unknown source.');
+const expectedUpdatedAtSchema = z.string().min(1).max(64).nullable().describe('Exact updatedAt from finance_get_review, or null only when no review exists. Reload after a conflict.');
+
+function corsHeaders(origin: string | null): Record<string, string> {
+  return {
+    'Access-Control-Allow-Headers': 'authorization, content-type, mcp-protocol-version, mcp-session-id, mcp-method, mcp-name',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Expose-Headers': 'mcp-protocol-version, mcp-session-id, www-authenticate',
+    Vary: 'Origin',
+    ...(origin && ALLOWED_ORIGINS.has(origin) ? { 'Access-Control-Allow-Origin': origin } : {}),
+  };
+}
+
+function withCors(response: Response, origin: string | null): Response {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(corsHeaders(origin))) headers.set(key, value);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers },
+  });
+}
+
+function oauthChallenge(status: 401 | 403, message: string): Response {
+  return jsonResponse({
+    error: status === 401 ? 'invalid_token' : 'insufficient_access',
+    error_description: message,
+  }, status, { 'WWW-Authenticate': `Bearer resource_metadata="${RESOURCE_METADATA_URL}"` });
+}
+
+function createUserClient(token: string): SupabaseClient {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: { autoRefreshToken: false, detectSessionInUrl: false, persistSession: false },
+    global: { headers: { Authorization: `Bearer ${token}` } },
+  });
+}
+
+function decodeJwtClaims(token: string): Record<string, unknown> | null {
+  try {
+    const encoded = token.split('.')[1];
+    if (!encoded) return null;
+    const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+    const bytes = Uint8Array.from(atob(padded), character => character.charCodeAt(0));
+    const claims = JSON.parse(new TextDecoder().decode(bytes));
+    return claims && typeof claims === 'object' && !Array.isArray(claims) ? claims : null;
+  } catch {
+    return null;
+  }
+}
+
+async function verifyAccess(request: Request): Promise<AuthInfo | Response> {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return jsonResponse({ error: 'Your Life One Finance is not configured.' }, 503);
+  const token = request.headers.get('authorization')?.match(/^Bearer\s+([^\s]+)$/i)?.[1];
+  if (!token) return oauthChallenge(401, 'A Your Life One OAuth access token is required.');
+  const client = createUserClient(token);
+  const { data, error } = await client.auth.getUser(token);
+  const claims = decodeJwtClaims(token);
+  const clientId = typeof claims?.client_id === 'string' ? claims.client_id : '';
+  const expiresAt = typeof claims?.exp === 'number' ? claims.exp : 0;
+  if (error || !data.user || !clientId || claims?.sub !== data.user.id) {
+    return oauthChallenge(401, 'The Your Life One OAuth access token is invalid.');
+  }
+  if (expiresAt <= Math.floor(Date.now() / 1_000)) return oauthChallenge(401, 'The Your Life One OAuth access token has expired.');
+
+  // Inventory, Employment and Equity approval never authorize Finance. The finance service rechecks
+  // this client's independent Finance approval on every request; the access-only route loads no business data.
+  const access = await probeFinanceAccess(token, '/review/access');
+  if (access === 'not_approved') return oauthChallenge(403, 'This OAuth client is not approved for Your Life One Finance.');
+  if (access === 'invalid_token') return oauthChallenge(401, 'The Your Life One OAuth access token is invalid.');
+  if (access === 'unavailable') return jsonResponse({ error: 'Your Life One Finance could not verify access.' }, 503);
+  return {
+    token, clientId, expiresAt,
+    scopes: typeof claims.scope === 'string' ? claims.scope.split(/\s+/).filter(Boolean) : [],
+    resource: new URL(RESOURCE_URL),
+    extra: { userId: data.user.id },
+  };
+}
+
+async function forward(tool: string, run: () => Promise<unknown>) {
+  try {
+    return toolResult(await run());
+  } catch (error) {
+    return toolFailure(error, `Your Life One Finance rejected ${tool}.`);
+  }
+}
+
+async function readProfileReview(token: string) {
+  const body = await callFinance(token, 'Your Life One Finance could not read loan profiles.', { method: 'GET', path: '/review' });
+  return (body as { review?: { loanProfiles?: z.infer<typeof profileSchema>[]; updatedAt: string } | null }).review ?? null;
+}
+
+function registerFinanceTools(server: McpServer, token: string): void {
+  server.registerTool('finance_get_review', {
+    title: 'Get Your Life One Banking Review and Loans',
+    description: 'Read this account’s current dated banking review, monthly cash flow, budget assumptions, spending opportunities and loans, or null when none exists. Dated information is not a live bank balance. Read before replacing the review.',
+    inputSchema: z.object({}).strict(),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => forward('finance_get_review', async () => {
+    const body = await callFinance(token, 'Your Life One Finance rejected finance_get_review.', { method: 'GET', path: '/review' });
+    return (body as { review?: unknown } | null)?.review ?? null;
+  }));
+  server.registerTool('finance_list_loan_profiles', {
+    title: 'List Saved Loan Scenarios',
+    description: 'List this account’s named loan planning profiles and the current review updatedAt. These are saved assumptions, not live balances or payment instructions.',
+    inputSchema: z.object({}).strict(),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, () => forward('finance_list_loan_profiles', async () => {
+    const review = await readProfileReview(token);
+    return { profiles: review?.loanProfiles ?? [], updatedAt: review?.updatedAt ?? null };
+  }));
+  server.registerTool('finance_get_loan_profile', {
+    title: 'Get Saved Loan Scenario',
+    description: 'Read one saved loan planning profile by ID, or null if missing, with the review updatedAt for a later save.',
+    inputSchema: z.object({ profileId: idSchema }).strict(),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, input => forward('finance_get_loan_profile', async () => {
+    const review = await readProfileReview(token);
+    return { profile: review?.loanProfiles?.find(profile => profile.id === input.profileId) ?? null, updatedAt: review?.updatedAt ?? null };
+  }));
+  server.registerTool('finance_save_loan_profile', {
+    title: 'Save Named Loan Scenario',
+    description: 'Create or replace one named loan planning profile. Read the review first and supply its exact updatedAt. Setting isDefault clears the other profile default flags. Preserves every other review field. Reuse requestId and exact input for a retry. This never changes a loan or makes a payment.',
+    inputSchema: z.object({ requestId: requestIdSchema, profile: profileSchema, expectedUpdatedAt: z.string().min(1).max(64) }).strict(),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, input => forward('finance_save_loan_profile', () => callFinance(token, 'Your Life One Finance rejected finance_save_loan_profile.', {
+    method: 'PUT', path: '/review', requestId: input.requestId,
+    body: { loanProfileChange: { operation: 'save', profile: input.profile }, expectedUpdatedAt: input.expectedUpdatedAt },
+  })));
+  server.registerTool('finance_remove_loan_profile', {
+    title: 'Remove Saved Loan Scenario',
+    description: 'Remove exactly one saved profile with explicit confirmed=true and the latest review updatedAt. Preserves all other review fields. Reuse the same requestId and input for an exact retry. This does not change borrowing or payments.',
+    inputSchema: z.object({ requestId: requestIdSchema, profileId: idSchema, confirmed: z.literal(true), expectedUpdatedAt: z.string().min(1).max(64) }).strict(),
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  }, input => forward('finance_remove_loan_profile', () => callFinance(token, 'Your Life One Finance rejected finance_remove_loan_profile.', {
+    method: 'PUT', path: '/review', requestId: input.requestId,
+    body: { loanProfileChange: { operation: 'remove', profileId: input.profileId, confirmed: input.confirmed }, expectedUpdatedAt: input.expectedUpdatedAt },
+  })));
+  server.registerTool('finance_save_review', {
+    title: 'Save Your Life One Banking Review and Loans',
+    description: 'Replace the complete current private review with source-dated verified information and explicit uncertainty. Amounts are integer pence. Preserve loans, sources and expenseGroups; keep household transfers separate to prevent double counting and loan balances separate from settlement quotes. Expense groups classify category labels across all months: non-discretionary, necessary, or discretionary. Supply the exact updatedAt from the latest read, or null for the first save. Reuse requestId only for an exact retry. Omitted or null loanProfiles preserve stored scenarios; an explicit empty array clears them. This cannot access banks, move money, change borrowing or make payments.',
+    inputSchema: z.object({ requestId: requestIdSchema, review: draftSchema, expectedUpdatedAt: expectedUpdatedAtSchema }).strict(),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, input => forward('finance_save_review', () => callFinance(token, 'Your Life One Finance rejected finance_save_review.', {
+    method: 'PUT', path: '/review', requestId: input.requestId,
+    body: { review: input.review, expectedUpdatedAt: input.expectedUpdatedAt },
+  })));
+}
+
+const mcpHandler = createMcpHandler(({ authInfo }) => {
+  if (!authInfo) throw new Error('A verified Your Life One OAuth access token is required.');
+  const server = new McpServer({ name: 'your-life-one-finance', version: '0.1.0' });
+  registerFinanceTools(server, authInfo.token);
+  return server;
+}, { responseMode: 'json' });
+
+export async function handleRequest(request: Request): Promise<Response> {
+  const origin = request.headers.get('origin');
+  if (origin && !ALLOWED_ORIGINS.has(origin)) return jsonResponse({ error: 'Origin is not allowed.' }, 403);
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(origin) });
+  const pathname = new URL(request.url).pathname.replace(/\/+$/, '');
+  if (pathname.endsWith('/.well-known/oauth-protected-resource')) {
+    return withCors(jsonResponse({
+      resource: RESOURCE_URL, resource_name: 'Your Life One Finance',
+      authorization_servers: [`${SUPABASE_URL}/auth/v1`],
+      bearer_methods_supported: ['header'], scopes_supported: ['openid'], deploymentSha: ASSISTANT_DEPLOY_SHA,
+    }), origin);
+  }
+  if (!pathname.endsWith('/mcp')) return withCors(jsonResponse({ error: 'Not found.' }, 404), origin);
+  const access = await verifyAccess(request);
+  if (access instanceof Response) return withCors(access, origin);
+  return withCors(await mcpHandler.fetch(request, { authInfo: access }), origin);
+}

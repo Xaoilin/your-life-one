@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">Your Life One S1 monogram</title>
+  <defs>
+    <linearGradient id="bg" x1="72" y1="48" x2="438" y2="468" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#151a2a"/>
+      <stop offset="1" stop-color="#080a11"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="124" y1="128" x2="390" y2="390" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#818cf8"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <rect x="18" y="18" width="476" height="476" rx="100" fill="none" stroke="#27304a" stroke-width="16"/>
+  <path d="M118 179c0-48 39-87 87-87h94v60h-94c-15 0-27 12-27 27s12 27 27 27h48c53 0 96 43 96 96s-43 96-96 96H112v-60h141c20 0 36-16 36-36s-16-36-36-36h-48c-48 0-87-39-87-87Z" fill="url(#mark)"/>
+  <path d="M353 158h-49v-49h109v289h-60V158Z" fill="#d8fbff"/>
+</svg>

@@ -1,0 +1,208 @@
+server:
+  port: ${PORT:8080}
+
+spring:
+  application:
+    name: life-service
+  datasource:
+    # SPRING_DATASOURCE_URL, _USERNAME and _PASSWORD are required at runtime.
+    hikari:
+      maximum-pool-size: 2
+      minimum-idle: ${APP_DATASOURCE_MINIMUM_IDLE:1}
+      # Opening a TLS connection through the Supabase pooler can take a few seconds.
+      connection-timeout: ${APP_DATASOURCE_CONNECTION_TIMEOUT_MS:8000}
+      # Keep one connection warm and validate it with keepalive. Avoid reopening TLS connections
+      # every five minutes; the bounded pool still replaces stale or broken connections.
+      keepalive-time: 60000
+      idle-timeout: 120000
+      max-lifetime: ${APP_DATASOURCE_MAX_LIFETIME_MS:1800000}
+      validation-timeout: 250
+      # Start even when the database is unreachable; health reports DOWN until it returns.
+      initialization-fail-timeout: -1
+      data-source-properties:
+        sslmode: ${APP_DATASOURCE_SSLMODE:require}
+  rabbitmq:
+    template:
+      observation-enabled: true
+    listener:
+      simple:
+        observation-enabled: true
+    # SPRING_RABBITMQ_HOST, _USERNAME and _PASSWORD are set by the deploy.
+    connection-timeout: 2s
+  jpa:
+    open-in-view: false
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    properties:
+      # Do not contact the database while starting.
+      hibernate.boot.allow_jdbc_metadata_access: false
+
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+    export:
+      enabled: ${GRAFANA_TRACING_ENABLED:false}
+  opentelemetry:
+    tracing:
+      export:
+        max-queue-size: 512
+        max-batch-size: 128
+        timeout: 3s
+        schedule-delay: 5s
+        otlp:
+          endpoint: ${GRAFANA_OTLP_TRACES_URL:http://127.0.0.1:4318/v1/traces}
+          connect-timeout: 1s
+          timeout: 3s
+      limits:
+        max-attributes: 32
+        max-attribute-value-length: 128
+        max-events: 4
+        max-links: 4
+        max-attributes-per-event: 4
+        max-attributes-per-link: 4
+    resource-attributes:
+      "service.instance.id": ${APP_SERVICE_INSTANCE_ID:local}
+      "deployment.environment.name": ${APP_ENVIRONMENT:production}
+  endpoints:
+    access:
+      # No actuator endpoint is served over HTTP; metrics are pushed to Grafana Cloud.
+      default: none
+  metrics:
+    tags:
+      service: life-service
+      instance: ${APP_SERVICE_INSTANCE_ID:local}
+    distribution:
+      slo:
+        "[http.server.requests]": 100ms,300ms,1s,3s,10s
+        "[http.client.requests]": 100ms,300ms,1s,3s,10s
+      percentiles:
+        "[http.server.requests]": 0.5, 0.95, 0.99
+    data:
+      repository:
+        autotime:
+          # How long each database repository call takes.
+          percentiles: 0.5, 0.95, 0.99
+  otlp:
+    metrics:
+      export:
+        # Pushed to Grafana Cloud's OTLP gateway once a minute; off unless the deploy provides a token.
+        enabled: ${GRAFANA_METRICS_ENABLED:false}
+        url: ${GRAFANA_OTLP_METRICS_URL:http://localhost:4318/v1/metrics}
+        headers:
+          Authorization: ${GRAFANA_OTLP_AUTHORIZATION:}
+        step: 1m
+        connect-timeout: 1s
+        read-timeout: 3s
+
+app:
+  write-commands:
+    queue: yourlife.life.commands
+    # Service-wide command inbox; each domain's writes are claimed here in the same transaction.
+    processed-table: life.processed_command
+    # The React app gives up after 10 seconds; answer before it does.
+    reply-timeout: 8s
+    # One write at a time keeps the second database connection free for reads.
+    consumers: 1
+    # Processed writes are remembered this long (a retry within it is applied once), then deleted.
+    retention: 30d
+  cors:
+    allowed-origins: ${APP_CORS_ALLOWED_ORIGINS:http://localhost:5173,https://your-life-one.example}
+  auth:
+    # Public Supabase project URL; access tokens are verified against its JWKS.
+    supabase-url: ${SUPABASE_URL:https://example-project.supabase.co}
+  rate-limit:
+    # Per signed-in user: this many requests at once, refilled at requests-per-minute.
+    requests-per-minute: ${APP_RATE_LIMIT_PER_MINUTE:120}
+    burst: ${APP_RATE_LIMIT_BURST:60}
+  life:
+    # AI agents reach inventory and jobs with Supabase OAuth tokens (they carry a client_id). A client
+    # may use a domain only while the user's approval for it is active in that domain's table.
+    agent-access:
+      approvals:
+        inventory: public.yourlifeone_inventory_oauth_clients
+        jobs: public.yourlifeone_employment_oauth_clients
+    health:
+      ratings: good, mixed, bad, awful
+      symptoms: fine, bloated, sluggish, nauseous, headache, thirsty, brain-fog, cravings
+    jobs:
+      statuses: lead, recruiter, applied, interview, offer, closed
+      work-types: contract, permanent, unknown
+      remote-regions: uk, emea, global, unknown
+      remote-statuses: confirmed, needs_verification
+      history-kinds: application, contact, document, remote_evidence, note
+      # Fields an update may clear (set back to absent).
+      clearable-fields: url, remoteCaveat, compensation, applicationDate, nextActionDate
+      default-remote-evidence: Remote eligibility needs verification.
+      default-next-action: Review the latest evidence and decide the next step.
+      max-applications: 10000
+      max-history: 1000
+      max-page-size: 100
+    inventory:
+      tracking-modes: durable, counted, measured
+      conditions: unknown, new, good, worn, needs_repair
+      priorities: low, normal, high
+      need-statuses: needed, ordered, acquired, dismissed
+      dimension-units: mm, cm, m, in
+      max-batch: 100
+      max-search-results: 100
+      max-specifications: 30
+      max-tags: 25
+      max-project-keys: 25
+      # Broad categories group records; each detailed subcategory belongs to exactly one category.
+      subcategories:
+        3d_printers: machine
+        other_machines: machine
+        workshop_equipment: tool
+        general_tools: tool
+        hand_tools: tool
+        power_tools: tool
+        measuring_tools: tool
+        screws_fasteners: fastener
+        filament: material
+        resin: material
+        wire_cable: material
+        connectors_terminals: component
+        power_supplies: electronics
+        power_modules: component
+        switches_relays: component
+        microcontrollers: electronics
+        prototyping_boards: component
+        fuses_protection: component
+        lights_alarms: component
+        heat_shrink_sleeving: consumable
+        cable_management: consumable
+        magnets: component
+        adhesives_tapes: material
+        mechanical_hardware: component
+        general_components: component
+        general_electronics: electronics
+        general_materials: material
+        general_consumables: consumable
+        storage_organisation: storage
+        safety_equipment: safety
+        other: other
+    trips:
+      statuses: planning, booked, in_trip, completed, archived
+      transport-modes: flight, train, bus, ferry, car, other
+      budget-categories: transport, food, events, rent, shopping, fees, other
+      budget-statuses: planned, paid
+      # The budget category each booking kind counts under.
+      booking-budget-categories:
+        transport: transport
+        stay: rent
+      default-currency: GBP
+      max-legs: 100
+
+logging:
+  structured:
+    format:
+      console: ecs
+
+jdbc:
+  includes: QUERY
+  datasource-proxy:
+    include-parameter-values: false
+    query:
+      enable-logging: false
+    slow-query:
+      enable-logging: false

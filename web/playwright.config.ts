@@ -1,0 +1,53 @@
+import { defineConfig } from '@playwright/test';
+
+const port = Number(process.env.YOUR_LIFE_ONE_E2E_PORT);
+if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+  throw new Error(
+    'YOUR_LIFE_ONE_E2E_PORT must be an allocated TCP port. Run Playwright through scripts/run-playwright.mjs.',
+  );
+}
+
+const baseURL = `http://127.0.0.1:${port}/yourlifeone/`;
+const isCi = Boolean(process.env.CI);
+const runId = process.env.YOUR_LIFE_ONE_E2E_RUN_ID || String(port);
+
+export default defineConfig({
+  testDir: './e2e',
+  outputDir: `test-results/playwright/${runId}`,
+  timeout: 30_000,
+  // Match CI while the local full gate also builds and runs unit tests.
+  workers: 2,
+  retries: 0,
+  failOnFlakyTests: isCi,
+  use: {
+    baseURL,
+    headless: true,
+    screenshot: 'only-on-failure',
+    timezoneId: 'Europe/London',
+  },
+  webServer: {
+    command: `npm exec vite -- --host 127.0.0.1 --port ${port} --strictPort`,
+    env: {
+      VITE_ACCESS_API_BASE_URL: 'https://identity.yourlifeone.test/api/access',
+      // Every browser test runs against the stateful service fakes in e2e/support/fake-services.ts.
+      VITE_PRAYER_API_BASE_URL: 'https://services.yourlifeone.test',
+      VITE_PROFILE_API_BASE_URL: 'https://services.yourlifeone.test',
+      VITE_CALENDAR_API_BASE_URL: 'https://services.yourlifeone.test',
+      VITE_LIFE_API_BASE_URL: 'https://services.yourlifeone.test',
+      VITE_KNOWLEDGE_API_BASE_URL: 'https://services.yourlifeone.test',
+      VITE_PLANNER_API_BASE_URL: 'https://services.yourlifeone.test',
+      VITE_FINANCE_API_BASE_URL: 'https://services.yourlifeone.test',
+    },
+    url: baseURL,
+    reuseExistingServer: false,
+    timeout: 15_000,
+  },
+  projects: [
+    {
+      name: 'firefox',
+      use: {
+        browserName: 'firefox',
+      },
+    },
+  ],
+});

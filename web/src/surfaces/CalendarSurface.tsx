@@ -1,0 +1,1032 @@
+import { useViewPreference } from '../store/ViewPreferencesContext';
+import { useEffect, useState, useMemo } from 'react';
+import { useShell } from "../store/ShellContext";
+import { calendarErrorMessage, useCalendar } from "../store/contexts/CalendarContext";
+import { useSettingsContext } from "../store/contexts/SettingsContext";
+import {
+  getAllDayCalendarDateRange,
+  isAllDayCalendarEventOnDate,
+  normalizeCalendarDate,
+} from '../services/calendarEventDates';
+import { logError } from '../services/logger';
+import { formatAppDate, formatAppTime, getAppDate } from '../services/appTimeZone';
+import { dateTimeLocalToInstant, instantToDateTimeLocal } from '../services/timeZone';
+import type { CalendarAccount, CalendarEvent } from '../types/domain';
+import { calendarSelectedDate, calendarWindow } from '../services/calendarWindow';
+
+function isGoogleCalendarAccount(account: CalendarAccount): boolean {
+  return account.provider === 'google';
+}
+
+function googleStatusLabel(account: CalendarAccount): string {
+  switch (account.authStatus) {
+    case 'needs_reconnect': return 'Needs reconnect';
+    case 'revoked': return 'Access revoked';
+    case 'error': return 'Error';
+    default: return 'Connected';
+  }
+}
+
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const ACCOUNT_PALETTES = [
+  { bg: '#1a2744', border: '#3b82f6', text: '#93bbfc' },
+  { bg: '#2a1f3d', border: '#a855f7', text: '#c4a0f7' },
+  { bg: '#1a3328', border: '#22c55e', text: '#86efac' },
+  { bg: '#3d2a1a', border: '#f59e0b', text: '#fcd34d' },
+  { bg: '#3d1a2a', border: '#ec4899', text: '#f9a8d4' },
+  { bg: '#1a3a3d', border: '#14b8a6', text: '#5eead4' },
+  { bg: '#3d2d1a', border: '#f97316', text: '#fdba74' },
+  { bg: '#2d1a1a', border: '#ef4444', text: '#fca5a5' },
+] as const;
+
+type Tab = 'month' | 'week' | 'agenda' | 'accounts';
+
+export default function CalendarSurface() {
+  const shell = useShell();
+  const calendar = useCalendar();
+  const settings = useSettingsContext();
+  const appTimeZone = settings.appTimeZone.effectiveTimeZone;
+  const currentAppDate = getAppDate(new Date(), appTimeZone) || new Date().toISOString().slice(0, 10);
+  const toCalendarMarker = (date: string) => {
+    const [markerYear, markerMonth, markerDay] = date.split('-').map(Number);
+    return new Date(Date.UTC(markerYear, markerMonth - 1, markerDay));
+  };
+  const [tab, setTab] = useViewPreference<Tab>('calendar.view', settings.settings.defaultCalendarTab || 'week');
+  const [viewDate, setViewDate] = useState(() => toCalendarMarker(currentAppDate));
+  const [selectedDateStr, setSelectedDateStr] = useState(currentAppDate);
+  const requestWindow = calendar.requestWindow;
+  const viewMarker = viewDate.toISOString().slice(0, 10);
+  useEffect(() => {
+    requestWindow?.(calendarWindow(viewMarker, tab));
+    setSelectedDateStr(selected => calendarSelectedDate(viewMarker, tab, selected));
+  }, [requestWindow, tab, viewMarker]);
+  const [showAddAccount, setShowAddAccount] = useState(false);
+  const [showAddEvent, setShowAddEvent] = useState(false);
+  const [editingAccount, setEditingAccount] = useState<CalendarAccount | null>(null);
+  const [editingEvent, setEditingEvent] = useState<CalendarEvent | null>(null);
+  const [deletingAccountId, setDeletingAccountId] = useState<string | null>(null);
+  const [deletingEventId, setDeletingEventId] = useState<string | null>(null);
+  const [savingEvent, setSavingEvent] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [eventWriteError, setEventWriteError] = useState<string | null>(null);
+  const [movingSourceId, setMovingSourceId] = useState<string | null>(null);
+
+  // Form state for account
+  const [accName, setAccName] = useState('');
+  const [accEmail, setAccEmail] = useState('');
+
+  // Form state for event
+  const [evtTitle, setEvtTitle] = useState('');
+  const [evtDesc, setEvtDesc] = useState('');
+  const [evtStart, setEvtStart] = useState('');
+  const [evtEnd, setEvtEnd] = useState('');
+  const [evtSourceId, setEvtSourceId] = useState('');
+  const [evtAllDay, setEvtAllDay] = useState(false);
+  const [evtLocation, setEvtLocation] = useState('');
+
+  const today = toCalendarMarker(currentAppDate);
+  const year = viewDate.getUTCFullYear();
+  const month = viewDate.getUTCMonth();
+
+  // Multi-account sync
+  const googleAccounts = calendar.calendarAccounts.filter(isGoogleCalendarAccount);
+  const syncState = calendar.syncing ? 'syncing' : calendar.syncProblem ? 'error' : 'idle';
+  const syncError = calendar.syncProblem;
+  const lastSyncTime = googleAccounts.map(account => account.lastSyncTime).filter(Boolean).sort().at(-1) ?? null;
+  const triggerSync = () => calendar.syncGoogle();
+  const hasGoogleAccounts = googleAccounts.length > 0;
+
+  /** Runs a calendar change; a refusal is shown, never swallowed. */
+  const run = (change: () => Promise<unknown>) => {
+    setActionError(null);
+    change().catch(error => setActionError(calendarErrorMessage(error)));
+  };
+  const [syncStatusNow, setSyncStatusNow] = useState(() => new Date());
+
+  useEffect(() => {
+    if (!lastSyncTime) return undefined;
+    const interval = window.setInterval(() => setSyncStatusNow(new Date()), 60_000);
+    return () => window.clearInterval(interval);
+  }, [lastSyncTime]);
+
+  useEffect(() => {
+    const date = getAppDate(new Date(), appTimeZone) || new Date().toISOString().slice(0, 10);
+    setSelectedDateStr(date);
+    setViewDate(toCalendarMarker(date));
+  }, [appTimeZone]);
+
+  // Visible sources
+  const visibleSourceIds = useMemo(
+    () => new Set(calendar.calendarSources.filter(s => s.visible).map(s => s.id)),
+    [calendar.calendarSources]
+  );
+
+  const visibleEvents = useMemo(
+    () => calendar.calendarEvents.filter(e => visibleSourceIds.has(e.sourceId)),
+    [calendar.calendarEvents, visibleSourceIds]
+  );
+
+  // Helpers
+  const isGoogleSource = (sourceId: string) => Boolean(
+    calendar.calendarSources.find(s => s.id === sourceId)?.googleCalendarId,
+  );
+  const writableSources = calendar.calendarSources.filter(source => source.writable !== false);
+
+  const getSourceColor = (sourceId: string) => {
+    return calendar.calendarSources.find(s => s.id === sourceId)?.color || '#4f5bff';
+  };
+
+  const accountPaletteMap = useMemo(() => {
+    const map = new Map<string, typeof ACCOUNT_PALETTES[number]>();
+    calendar.calendarAccounts.forEach((acc, i) => {
+      const idx = acc.paletteIndex ?? i;
+      map.set(acc.id, ACCOUNT_PALETTES[idx % ACCOUNT_PALETTES.length]);
+    });
+    return map;
+  }, [calendar.calendarAccounts]);
+
+  const getEventPalette = (sourceId: string) => {
+    const source = calendar.calendarSources.find(s => s.id === sourceId);
+    if (!source) return ACCOUNT_PALETTES[0];
+    return accountPaletteMap.get(source.accountId) || ACCOUNT_PALETTES[0];
+  };
+
+  const isToday = (date: Date) => toLocalDateStr(date) === toLocalDateStr(today);
+
+  const toLocalDateStr = (d: Date) =>
+    `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+
+  const formatCalendarDate = (date: Date) => date.toLocaleDateString([], {
+    weekday: 'long',
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'UTC',
+  });
+
+  const formatAppDateTime = (value: string) => {
+    const instant = new Date(value);
+    return `${formatAppDate(instant, appTimeZone)} at ${formatAppTime(instant, appTimeZone)}`;
+  };
+
+  const formatEventDate = (event: CalendarEvent) => {
+    if (!event.allDay) return formatAppDate(new Date(event.start), appTimeZone);
+    const range = getAllDayCalendarDateRange(event, appTimeZone);
+    return range ? formatCalendarDate(toCalendarMarker(range.startDate)) : '—';
+  };
+
+  const getEventsForDate = (date: Date) => {
+    const dateStr = toLocalDateStr(date);
+    return visibleEvents.filter(event => event.allDay
+      ? isAllDayCalendarEventOnDate(event, dateStr, appTimeZone)
+      : getAppDate(new Date(event.start), appTimeZone) === dateStr);
+  };
+
+  const selectedDate = useMemo(() => {
+    return toCalendarMarker(selectedDateStr);
+  }, [selectedDateStr]);
+
+  const selectedDateEvents = useMemo(
+    () => getEventsForDate(selectedDate).sort((a, b) => {
+      if (a.allDay && !b.allDay) return -1;
+      if (!a.allDay && b.allDay) return 1;
+      return a.start.localeCompare(b.start);
+    }),
+    // getEventsForDate closes over visibleEvents and is intentionally recalculated when visible events change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [selectedDate, visibleEvents],
+  );
+
+  // ── Month Grid ──
+  const calendarDays = useMemo(() => {
+    const firstDay = new Date(Date.UTC(year, month, 1)).getUTCDay();
+    const daysInMonth = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+    const daysInPrev = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    const days: { date: Date; isCurrentMonth: boolean }[] = [];
+
+    for (let i = firstDay - 1; i >= 0; i--) {
+      days.push({ date: new Date(Date.UTC(year, month - 1, daysInPrev - i)), isCurrentMonth: false });
+    }
+    for (let d = 1; d <= daysInMonth; d++) {
+      days.push({ date: new Date(Date.UTC(year, month, d)), isCurrentMonth: true });
+    }
+    const remaining = 42 - days.length;
+    for (let d = 1; d <= remaining; d++) {
+      days.push({ date: new Date(Date.UTC(year, month + 1, d)), isCurrentMonth: false });
+    }
+    return days;
+  }, [year, month]);
+
+  // ── Week Grid ──
+  const weekDays = useMemo(() => {
+    const startOfWeek = new Date(viewDate);
+    startOfWeek.setUTCDate(startOfWeek.getUTCDate() - startOfWeek.getUTCDay());
+    return Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(startOfWeek);
+      d.setUTCDate(d.getUTCDate() + i);
+      return d;
+    });
+  }, [viewDate]);
+
+  // ── Navigation ──
+  const prevMonth = () => setViewDate(new Date(Date.UTC(year, month - 1, 1)));
+  const nextMonth = () => setViewDate(new Date(Date.UTC(year, month + 1, 1)));
+  const prevWeek = () => { const d = new Date(viewDate); d.setUTCDate(d.getUTCDate() - 7); setViewDate(d); };
+  const nextWeek = () => { const d = new Date(viewDate); d.setUTCDate(d.getUTCDate() + 7); setViewDate(d); };
+  const goToday = () => setViewDate(toCalendarMarker(currentAppDate));
+  const shiftAgenda = (direction: number) => {
+    const next = new Date(viewDate);
+    next.setUTCDate(next.getUTCDate() + direction * 30);
+    setViewDate(next);
+  };
+
+  // ── Account CRUD ──
+  const openAddAccount = () => {
+    setAccName(''); setAccEmail(''); setEditingAccount(null); setActionError(null); setShowAddAccount(true);
+  };
+  const openEditAccount = (acc: CalendarAccount) => {
+    setAccName(acc.name); setAccEmail(acc.email); setEditingAccount(acc); setActionError(null); setShowAddAccount(true);
+  };
+  const saveAccount = async () => {
+    if (!accName.trim()) return;
+    setActionError(null);
+    try {
+      if (editingAccount) {
+        await calendar.updateCalendarAccount(editingAccount.id, { name: accName.trim() });
+      } else {
+        // The service creates the account together with its first calendar.
+        await calendar.addCalendarAccount({ name: accName.trim(), email: accEmail.trim() || undefined });
+      }
+      setShowAddAccount(false);
+    } catch (error) {
+      setActionError(calendarErrorMessage(error));
+    }
+  };
+
+  // ── Event CRUD ──
+  const openAddEvent = (presetDate?: Date) => {
+    setEvtTitle(''); setEvtDesc(''); setEvtAllDay(false); setEvtLocation('');
+    const now = new Date();
+    const startStr = presetDate
+      ? `${toLocalDateStr(presetDate)}T09:00`
+      : instantToDateTimeLocal(now, appTimeZone) || `${currentAppDate}T09:00`;
+    const endStr = presetDate
+      ? `${toLocalDateStr(presetDate)}T10:00`
+      : instantToDateTimeLocal(new Date(now.getTime() + 3_600_000), appTimeZone)
+        || `${currentAppDate}T10:00`;
+    setEvtStart(startStr); setEvtEnd(endStr);
+    setEvtSourceId(writableSources[0]?.id || '');
+    setEventWriteError(null);
+    setEditingEvent(null); setShowAddEvent(true);
+  };
+  const openEditEvent = (evt: CalendarEvent) => {
+    setEvtTitle(evt.title); setEvtDesc(evt.description); setEvtAllDay(evt.allDay);
+    if (evt.allDay) {
+      const range = getAllDayCalendarDateRange(evt, appTimeZone);
+      setEvtStart(range ? `${range.startDate}T00:00` : '');
+      setEvtEnd(range ? `${range.endDate}T23:59` : '');
+    } else {
+      setEvtStart(instantToDateTimeLocal(new Date(evt.start), appTimeZone) || '');
+      setEvtEnd(instantToDateTimeLocal(new Date(evt.end), appTimeZone) || '');
+    }
+    setEvtSourceId(evt.sourceId); setEvtLocation(evt.location || '');
+    setEventWriteError(null);
+    setEditingEvent(evt); setShowAddEvent(true);
+  };
+
+  const saveEvent = async () => {
+    if (!evtTitle.trim() || !evtSourceId) return;
+    setEventWriteError(null);
+    let start: string;
+    let end: string;
+    if (evtAllDay) {
+      const startDate = normalizeCalendarDate(evtStart.slice(0, 10));
+      const endDate = normalizeCalendarDate(evtEnd.slice(0, 10));
+      if (!startDate || !endDate) {
+        setEventWriteError('Choose valid all-day event dates.');
+        return;
+      }
+      if (endDate < startDate) {
+        setEventWriteError('All-day event end must be on or after its start.');
+        return;
+      }
+      start = startDate;
+      end = endDate;
+    } else {
+      const startInstant = dateTimeLocalToInstant(evtStart, appTimeZone);
+      const endInstant = dateTimeLocalToInstant(evtEnd, appTimeZone);
+      if (!startInstant || !endInstant) {
+        setEventWriteError(`Choose valid wall-clock times in ${appTimeZone}. Daylight-saving gaps do not exist.`);
+        return;
+      }
+      if (endInstant <= startInstant) {
+        setEventWriteError('Event end must be after its start.');
+        return;
+      }
+      start = startInstant.toISOString();
+      end = endInstant.toISOString();
+    }
+    const eventData = {
+      title: evtTitle.trim(),
+      description: evtDesc.trim(),
+      start,
+      end,
+      allDay: evtAllDay,
+      sourceId: evtSourceId,
+      location: evtLocation.trim() || undefined,
+    };
+
+    setSavingEvent(true);
+    try {
+      // Google calendars are changed in Google first; nothing is shown until the service confirms.
+      if (editingEvent) {
+        await calendar.updateCalendarEvent(editingEvent.id, eventData);
+      } else {
+        await calendar.addCalendarEvent(eventData);
+      }
+    } catch (err) {
+      logError('CalendarSurface', err);
+      const prefix = isGoogleSource(evtSourceId) ? 'Google Calendar was not changed: ' : 'The event was not saved: ';
+      setEventWriteError(`${prefix}${calendarErrorMessage(err)}`);
+      return;
+    } finally {
+      setSavingEvent(false);
+    }
+    setShowAddEvent(false);
+  };
+
+  const handleDeleteEvent = async () => {
+    if (!editingEvent) return;
+    setEventWriteError(null);
+    setSavingEvent(true);
+    try {
+      await calendar.removeCalendarEvent(editingEvent.id);
+    } catch (err) {
+      logError('CalendarSurface', err);
+      const prefix = isGoogleSource(editingEvent.sourceId) ? 'Google Calendar was not changed: ' : 'The event was not deleted: ';
+      setEventWriteError(`${prefix}${calendarErrorMessage(err)}`);
+      return;
+    } finally {
+      setSavingEvent(false);
+    }
+    setShowAddEvent(false);
+    setDeletingEventId(null);
+  };
+
+  // ── Agenda ──
+  const agendaEvents = useMemo(() => {
+    const now = new Date().toISOString();
+    const window = calendarWindow(viewMarker, 'agenda');
+    return [...visibleEvents].filter(event => {
+      if (!event.allDay) {
+        const start = getAppDate(new Date(event.start), appTimeZone);
+        const end = getAppDate(new Date(event.end), appTimeZone);
+        return event.end >= now && Boolean(start && end && start <= window.to && end >= window.from);
+      }
+      const range = getAllDayCalendarDateRange(event, appTimeZone);
+      return Boolean(range && range.endDate >= currentAppDate && range.startDate <= window.to && range.endDate >= window.from);
+    }).sort((a, b) => a.start.localeCompare(b.start)).slice(0, 30);
+  }, [appTimeZone, currentAppDate, viewMarker, visibleEvents]);
+
+  // ── Sync status ──
+  const syncStatusText = () => {
+    if (!hasGoogleAccounts) return null;
+    const reconnectCount = googleAccounts.filter(account => account.authStatus === 'needs_reconnect' || account.authStatus === 'revoked').length;
+    if (syncState === 'syncing') return <span className="sync-indicator syncing"><span className="spinner" /> Refreshing from Google...</span>;
+    if (reconnectCount > 0) {
+      return <span className="sync-indicator error">{reconnectCount} account{reconnectCount !== 1 ? 's' : ''} need reconnect</span>;
+    }
+    if (syncState === 'error') return <span className="sync-indicator error">{syncError || 'Google sync error'}</span>;
+    if (lastSyncTime) {
+      const ago = Math.round((syncStatusNow.getTime() - new Date(lastSyncTime).getTime()) / 60000);
+      const timeText = ago < 1 ? 'just now' : ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
+      return <span className="sync-indicator synced">Synced from Google {timeText}</span>;
+    }
+    return <span className="sync-indicator">Waiting for Google refresh</span>;
+  };
+
+  // ── Account color legend ──
+  const accountLegend = calendar.calendarAccounts.length > 1 ? (
+    <div className="account-legend" data-testid="account-legend">
+      {calendar.calendarAccounts.map(acc => {
+        const pal = accountPaletteMap.get(acc.id) || ACCOUNT_PALETTES[0];
+        return (
+          <div key={acc.id} className="account-legend-item">
+            <span className="account-legend-dot" style={{ background: pal.border }} />
+            <span className="account-legend-label">{acc.email}</span>
+          </div>
+        );
+      })}
+    </div>
+  ) : null;
+
+  // ── Week view header ──
+  const weekLabel = useMemo(() => {
+    const start = weekDays[0];
+    const end = weekDays[6];
+    if (start.getUTCMonth() === end.getUTCMonth()) {
+      return `${MONTHS[start.getUTCMonth()]} ${start.getUTCDate()} \u2013 ${end.getUTCDate()}, ${start.getUTCFullYear()}`;
+    }
+    return `${MONTHS[start.getUTCMonth()].slice(0, 3)} ${start.getUTCDate()} \u2013 ${MONTHS[end.getUTCMonth()].slice(0, 3)} ${end.getUTCDate()}, ${end.getUTCFullYear()}`;
+  }, [weekDays]);
+
+  return (
+    <>
+      <div className="surface-header">
+        <div>
+          <h1>Calendar</h1>
+          <div className="subtitle">
+            {!calendar.loaded ? 'Loading accounts...' : calendar.calendarAccounts.length === 0
+              ? 'No accounts connected'
+              : `${calendar.calendarAccounts.length} account${calendar.calendarAccounts.length > 1 ? 's' : ''} \u00b7 ${visibleEvents.length} visible event${visibleEvents.length !== 1 ? 's' : ''}`}
+            {hasGoogleAccounts ? (
+              <span style={{ marginLeft: 8 }}>{syncStatusText()}</span>
+            ) : (
+               <span className="mocked-indicator" style={{ marginLeft: 8, visibility: calendar.loaded ? undefined : 'hidden' }} role="status">Manual calendar &ndash; no external provider sync</span>
+             )}
+          </div>
+        </div>
+        <div className="actions-row">
+          {hasGoogleAccounts && (
+            <button className="btn btn-secondary btn-sm" onClick={() => { void triggerSync(); }} disabled={syncState === 'syncing'} title="Fetch the latest Google calendars now">
+              {syncState === 'syncing' ? <><span className="spinner" /> Syncing</> : '\u{21BB} Sync'}
+            </button>
+          )}
+          <button className="btn btn-secondary" onClick={() => openAddEvent()} disabled={!calendar.loaded || calendar.eventsLoading || Boolean(calendar.loadError) || writableSources.length === 0}>+ Event</button>
+          <button className="btn btn-primary" onClick={openAddAccount} disabled={!calendar.loaded || Boolean(calendar.loadError)}>+ Account</button>
+        </div>
+      </div>
+      <div className="surface-body">
+        <div role="status" aria-live="polite" style={{ minHeight: 20 }}>
+          {(!calendar.loaded || calendar.eventsLoading) ? 'Loading page data...' : ''}
+        </div>
+        {calendar.loadError && (
+          <div className="info-box warning" role="alert" style={{ marginBottom: 8 }}>
+            Calendar could not be refreshed: {calendar.loadError}{' '}
+            <button className="btn btn-secondary btn-sm" onClick={() => { void calendar.reload(); }}>Retry</button>
+          </div>
+        )}
+        {actionError && !showAddAccount && (
+          <div className="info-box warning" role="alert" style={{ marginBottom: 8 }}>{actionError}</div>
+        )}
+        <div className="tabs">
+          <button className={`tab ${tab === 'month' ? 'active' : ''}`} onClick={() => setTab('month')}>Month</button>
+          <button className={`tab ${tab === 'week' ? 'active' : ''}`} onClick={() => setTab('week')}>Week</button>
+          <button className={`tab ${tab === 'agenda' ? 'active' : ''}`} onClick={() => setTab('agenda')}>Agenda</button>
+          <button className={`tab ${tab === 'accounts' ? 'active' : ''}`} onClick={() => setTab('accounts')}>Accounts & Sources</button>
+        </div>
+
+        {/* ── Month View ── */}
+        {tab === 'month' && (
+          <div className="calendar-sidebar-panel">
+            <div className="calendar-main-panel">
+              <div className="calendar-controls">
+                <button className="btn-icon" onClick={prevMonth} aria-label="Previous month">&lsaquo;</button>
+                <h2>{MONTHS[month]} {year}</h2>
+                <button className="btn-icon" onClick={nextMonth} aria-label="Next month">&rsaquo;</button>
+                <button className="btn btn-secondary btn-sm" onClick={goToday}>Today</button>
+              </div>
+              {!calendar.loaded || (calendar.loadError && calendar.calendarAccounts.length === 0) ? null : calendar.calendarAccounts.length === 0 ? (
+                <div className="empty-state" role="status">
+                  <div className="empty-icon">&#128197;</div>
+                  <h3>No calendar accounts</h3>
+                  <p>Add a local calendar account or connect Google Calendar from Integrations.</p>
+                  <div className="actions-row" style={{ gap: 8 }}>
+                    <button className="btn btn-primary" onClick={openAddAccount}>+ Local Account</button>
+                    <button className="btn btn-secondary" onClick={() => shell.navigate('integrations')}>Connect Google</button>
+                  </div>
+                </div>
+              ) : (
+                <div className="calendar-grid">
+                  {DAYS.map(d => <div key={d} className="calendar-day-header">{d}</div>)}
+                  {calendarDays.map(({ date, isCurrentMonth }, i) => {
+                    const dayEvents = getEventsForDate(date);
+                    return (
+                      <div
+                        key={i}
+                        className={`calendar-day ${isCurrentMonth ? '' : 'other-month'} ${isToday(date) ? 'today' : ''} ${toLocalDateStr(date) === selectedDateStr ? 'selected' : ''}`}
+                      >
+                        <button
+                          type="button"
+                          className="day-num"
+                          aria-label={`Select ${formatCalendarDate(date)}`}
+                          aria-pressed={toLocalDateStr(date) === selectedDateStr}
+                          onClick={() => setSelectedDateStr(toLocalDateStr(date))}
+                        >
+                          {date.getUTCDate()}
+                        </button>
+                        {dayEvents.slice(0, 3).map(evt => {
+                          const pal = getEventPalette(evt.sourceId);
+                          return (
+                            <button
+                              type="button"
+                              key={evt.id}
+                              className="calendar-event-dot"
+                              style={{ appearance: 'none', background: pal.bg, borderTop: 0, borderRight: 0, borderBottom: 0, borderLeft: `2px solid ${pal.border}`, color: 'inherit', cursor: 'pointer', display: 'block', fontFamily: 'inherit', textAlign: 'left' }}
+                              onClick={() => openEditEvent(evt)}
+                              aria-label={`Open ${evt.title}`}
+                              title={evt.title}
+                            >
+                              {evt.pendingSync && <span className="event-pending-badge" />}
+                              {evt.title}
+                            </button>
+                          );
+                        })}
+                        {dayEvents.length > 3 && <div style={{ fontSize: 10, color: '#9499b0' }}>+{dayEvents.length - 3} more</div>}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              {calendar.calendarAccounts.length > 0 && (
+                <div className="calendar-mobile-selected-agenda">
+                  <div className="calendar-mobile-selected-title">
+                    {formatCalendarDate(selectedDate)}
+                  </div>
+                  {selectedDateEvents.length === 0 ? (
+                    <div className="calendar-mobile-empty">No events for this day.</div>
+                  ) : (
+                    selectedDateEvents.map(evt => {
+                      const pal = getEventPalette(evt.sourceId);
+                      return (
+                        <button
+                          key={evt.id}
+                          className="calendar-mobile-event"
+                          style={{ borderLeftColor: pal.border, background: pal.bg }}
+                          onClick={() => openEditEvent(evt)}
+                        >
+                          <span style={{ color: pal.text }}>
+                            {evt.allDay ? 'All day' : formatAppTime(new Date(evt.start), appTimeZone)}
+                          </span>
+                          <strong>{evt.title}</strong>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              )}
+            </div>
+            {calendar.calendarSources.length > 0 && (
+              <div className="calendar-right-panel">
+                <h3 style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: '#8b8fa3' }}>Calendars</h3>
+                {calendar.calendarSources.map(source => (
+                  <div key={source.id} className="source-toggle">
+                    <label className="toggle">
+                      <input type="checkbox" checked={source.visible} onChange={e => { const visible = e.target.checked; run(() => calendar.updateCalendarSource(source.id, { visible })); }} aria-label={`Toggle ${source.name} calendar`} />
+                      <span className="slider" />
+                    </label>
+                    <span className="dot" style={{ background: source.color }} />
+                    <span style={{ fontSize: 12 }}>
+                      {source.name}
+                      {source.googleCalendarId && <span style={{ fontSize: 10, color: '#8b90a8', marginLeft: 4 }}>(Google)</span>}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Week View (agenda columns) ── */}
+        {tab === 'week' && (
+          <div>
+            <div className="calendar-controls">
+              <button className="btn-icon" onClick={prevWeek} aria-label="Previous week">&lsaquo;</button>
+              <h2 style={{ minWidth: 280 }}>{weekLabel}</h2>
+              <button className="btn-icon" onClick={nextWeek} aria-label="Next week">&rsaquo;</button>
+              <button className="btn btn-secondary btn-sm" onClick={goToday}>Today</button>
+            </div>
+            {accountLegend}
+            {!calendar.loaded || (calendar.loadError && calendar.calendarAccounts.length === 0) ? null : calendar.calendarAccounts.length === 0 ? (
+              <div className="empty-state" role="status">
+                <div className="empty-icon">&#128197;</div>
+                <h3>No calendar accounts</h3>
+                <p>Add a calendar account to see events here.</p>
+                <div className="actions-row" style={{ gap: 8 }}>
+                  <button className="btn btn-primary" onClick={openAddAccount}>+ Local Account</button>
+                  <button className="btn btn-secondary" onClick={() => shell.navigate('integrations')}>Connect Google</button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="calendar-mobile-day-strip" aria-label="Week days">
+                  {weekDays.map((d, i) => {
+                    const dateStr = toLocalDateStr(d);
+                    const dayEvents = getEventsForDate(d);
+                    return (
+                      <button
+                        key={i}
+                        className={`calendar-mobile-day ${isToday(d) ? 'today' : ''} ${dateStr === selectedDateStr ? 'active' : ''}`}
+                        onClick={() => setSelectedDateStr(dateStr)}
+                      >
+                        <span>{DAYS[d.getUTCDay()]}</span>
+                        <strong>{d.getUTCDate()}</strong>
+                        {dayEvents.length > 0 && <em>{dayEvents.length}</em>}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="calendar-mobile-selected-agenda">
+                  <div className="calendar-mobile-selected-title">
+                    {formatCalendarDate(selectedDate)}
+                  </div>
+                  {selectedDateEvents.length === 0 ? (
+                    <div className="calendar-mobile-empty">No events for this day.</div>
+                  ) : (
+                    selectedDateEvents.map(evt => {
+                      const pal = getEventPalette(evt.sourceId);
+                      return (
+                        <button
+                          key={evt.id}
+                          className="calendar-mobile-event"
+                          style={{ borderLeftColor: pal.border, background: pal.bg }}
+                          onClick={() => openEditEvent(evt)}
+                        >
+                          <span style={{ color: pal.text }}>
+                            {evt.allDay ? 'All day' : formatAppTime(new Date(evt.start), appTimeZone)}
+                          </span>
+                          <strong>{evt.title}</strong>
+                          {evt.location && <small>{evt.location}</small>}
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+                <div className="week-columns">
+                  {weekDays.map((d, i) => {
+                    const dayEvents = getEventsForDate(d).sort((a, b) => {
+                    if (a.allDay && !b.allDay) return -1;
+                    if (!a.allDay && b.allDay) return 1;
+                    return a.start.localeCompare(b.start);
+                  });
+                  return (
+                    <div key={i} className={`week-col ${isToday(d) ? 'today' : ''}`}>
+                      <div className="week-col-header">
+                        <div className="week-col-dayname">{DAYS[d.getUTCDay()]}</div>
+                        <div className={`week-col-daynum ${isToday(d) ? 'today' : ''}`}>{d.getUTCDate()}</div>
+                      </div>
+                      <div className="week-col-events">
+                        {dayEvents.length === 0 && (
+                          <div style={{ padding: '12px 4px', fontSize: 11, color: '#6b7088', textAlign: 'center' }}>No events</div>
+                        )}
+                        {dayEvents.map(evt => (
+                          (() => {
+                            const pal = getEventPalette(evt.sourceId);
+                            return (
+                              <button
+                                type="button"
+                                key={evt.id}
+                                className="week-col-event"
+                                style={{
+                                  appearance: 'none',
+                                  borderLeftColor: pal.border,
+                                  background: pal.bg,
+                                  borderTop: 0,
+                                  borderRight: 0,
+                                  borderBottom: 0,
+                                  color: 'inherit',
+                                  fontFamily: 'inherit',
+                                  textAlign: 'left',
+                                  width: '100%',
+                                }}
+                                onClick={() => openEditEvent(evt)}
+                                aria-label={`Open ${evt.title}`}
+                              >
+                                <div className="week-col-event-time" style={{ color: pal.text }}>
+                                  {evt.allDay ? 'All day' : formatAppTime(new Date(evt.start), appTimeZone)}
+                                  {!evt.allDay && (
+                                    <> &ndash; {formatAppTime(new Date(evt.end), appTimeZone)}</>
+                                  )}
+                                </div>
+                                <div className="week-col-event-title">{evt.title}</div>
+                                {evt.location && <div className="week-col-event-loc">{evt.location}</div>}
+                              </button>
+                            );
+                          })()
+                        ))}
+                      </div>
+                    </div>
+                  );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ── Agenda View ── */}
+        {tab === 'agenda' && (
+          <>
+            <div className="calendar-nav">
+              <button className="btn-icon" onClick={() => shiftAgenda(-1)} aria-label="Previous 30 days">&lsaquo;</button>
+              <span>{calendarWindow(viewMarker, 'agenda').from} – {calendarWindow(viewMarker, 'agenda').to}</span>
+              <button className="btn-icon" onClick={() => shiftAgenda(1)} aria-label="Next 30 days">&rsaquo;</button>
+              <button className="btn btn-secondary btn-sm" onClick={goToday}>Today</button>
+            </div>
+            {accountLegend}
+            {!calendar.loaded || (calendar.loadError && calendar.calendarAccounts.length === 0) ? null : agendaEvents.length === 0 ? (
+              <div className="empty-state" role="status">
+                <div className="empty-icon">&#128197;</div>
+                <h3>No upcoming events</h3>
+                <p>Your agenda will show upcoming events from visible calendars.{hasGoogleAccounts ? ' Try syncing to pull latest.' : ''}</p>
+                {hasGoogleAccounts && (
+                  <button className="btn btn-secondary" onClick={() => { void triggerSync(); }} disabled={syncState === 'syncing'}>
+                    {syncState === 'syncing' ? 'Syncing...' : 'Sync Now'}
+                  </button>
+                )}
+              </div>
+            ) : (
+              agendaEvents.map(evt => (
+                <button
+                  type="button"
+                  key={evt.id}
+                  className="agenda-item"
+                  onClick={() => openEditEvent(evt)}
+                  aria-label={`Open ${evt.title}`}
+                  style={{ appearance: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', fontFamily: 'inherit', textAlign: 'left', width: '100%' }}
+                >
+                  <div className="agenda-time">
+                    {evt.allDay ? 'All day' : formatAppTime(new Date(evt.start), appTimeZone)}
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div className="agenda-title" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span className="dot" style={{ width: 8, height: 8, borderRadius: '50%', background: getSourceColor(evt.sourceId), display: 'inline-block', flexShrink: 0 }} />
+                      {evt.title}
+                      {evt.pendingSync && <span className="tag tag-pending" style={{ fontSize: 9, padding: '1px 4px' }} role="status">pending</span>}
+                      {evt.googleEventId && <span style={{ fontSize: 10, color: '#8b90a8' }}>(Google)</span>}
+                    </div>
+                    <div style={{ fontSize: 12, color: '#9499b0' }}>
+                      {formatEventDate(evt)}
+                      {evt.location && <> &middot; {evt.location}</>}
+                      {evt.description && <> &middot; {evt.description.slice(0, 60)}</>}
+                    </div>
+                  </div>
+                </button>
+              ))
+            )}
+          </>
+        )}
+
+        {/* ── Accounts & Sources ── */}
+        {tab === 'accounts' && (
+          <>
+            <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>Accounts</h3>
+            {googleAccounts.length > 0 && (
+              <div className="info-box" style={{ background: '#152d1a', borderColor: '#1e4d28' }}>
+                {googleAccounts.length} Google account{googleAccounts.length > 1 ? 's' : ''} connected.
+                {googleAccounts.some(account => account.authStatus === 'needs_reconnect' || account.authStatus === 'revoked')
+                  ? ' Some accounts need reconnect before they can sync again.'
+                  : ' Manage connections in '}
+                <button className="btn btn-secondary btn-sm" style={{ padding: '2px 8px', fontSize: 11, marginLeft: 6 }} onClick={() => shell.navigate('integrations')}>Integrations</button>
+              </div>
+            )}
+            {!calendar.loaded || (calendar.loadError && calendar.calendarAccounts.length === 0) ? null : calendar.calendarAccounts.length === 0 ? (
+              <div className="empty-state" role="status">
+                <div className="empty-icon">&#128231;</div>
+                <h3>No calendar accounts</h3>
+                <p>Add a local calendar account or connect Google Calendar from Integrations.</p>
+                <div className="actions-row" style={{ gap: 8 }}>
+                  <button className="btn btn-primary" onClick={openAddAccount}>+ Local Account</button>
+                  <button className="btn btn-secondary" onClick={() => shell.navigate('integrations')}>Connect Google</button>
+                </div>
+              </div>
+            ) : (
+              calendar.calendarAccounts.map(acc => {
+                const isGoogleAcc = isGoogleCalendarAccount(acc);
+                return (
+                  <div key={acc.id} className="card">
+                    <div className="card-header">
+                      <div>
+                        <h3 className="card-title">
+                          {acc.name}
+                          {acc.isPrimary && <span className="tag tag-primary" role="status">Primary</span>}
+                          {isGoogleAcc && <span className="tag tag-connected" style={{ marginLeft: 4 }} role="status">Google</span>}
+                        </h3>
+                        <div className="card-subtitle">
+                          {acc.email} &middot; {acc.provider}
+                          {acc.mocked && ' (manual provider)'}
+                          {isGoogleAcc && acc.lastSyncTime && ` \u00b7 Synced from Google ${formatAppDateTime(acc.lastSyncTime)}`}
+                        </div>
+                        {isGoogleAcc && (acc.lastAuthError || acc.syncError) && (
+                          <div style={{ fontSize: 11, marginTop: 4, color: acc.authStatus === 'error' ? '#f0c040' : '#ff6b6b' }}>
+                            {acc.lastAuthError || acc.syncError}
+                          </div>
+                        )}
+                      </div>
+                      <span className={`tag tag-${isGoogleAcc ? (acc.authStatus === 'needs_reconnect' ? 'needs-reconnect' : acc.authStatus || 'connected') : (acc.connected ? 'connected' : 'disconnected')}`} role="status">
+                        {isGoogleAcc ? googleStatusLabel(acc) : 'Local'}
+                      </span>
+                    </div>
+                    {/* Color picker */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '8px 0 4px' }}>
+                      <span style={{ fontSize: 11, color: '#9499b0' }}>Color:</span>
+                      {ACCOUNT_PALETTES.map((pal, pi) => {
+                        const isSelected = (acc.paletteIndex ?? calendar.calendarAccounts.indexOf(acc)) % ACCOUNT_PALETTES.length === pi;
+                        return (
+                          <button
+                            key={pi}
+                            onClick={() => run(() => calendar.updateCalendarAccount(acc.id, { paletteIndex: pi }))}
+                            aria-label={`Set color ${pi + 1}`}
+                            style={{
+                              width: 20,
+                              height: 20,
+                              borderRadius: 4,
+                              background: pal.bg,
+                              border: isSelected ? `2px solid ${pal.border}` : '2px solid transparent',
+                              cursor: 'pointer',
+                              padding: 0,
+                              boxShadow: isSelected ? `0 0 0 1px ${pal.border}` : 'none',
+                            }}
+                          >
+                            <span style={{ display: 'block', width: 8, height: 8, borderRadius: 2, background: pal.border, margin: '4px auto' }} />
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="actions-row" style={{ marginTop: 6 }}>
+                      {!acc.isPrimary && <button className="btn btn-secondary btn-sm" onClick={() => run(() => calendar.setPrimaryCalendarAccount(acc.id))}>Set Primary</button>}
+                      {!isGoogleAcc && <button className="btn btn-secondary btn-sm" onClick={() => openEditAccount(acc)}>Edit</button>}
+                      {isGoogleAcc
+                        ? <button className="btn btn-secondary btn-sm" onClick={() => shell.navigate('integrations')}>
+                            {acc.authStatus === 'needs_reconnect' || acc.authStatus === 'revoked' ? 'Reconnect in Integrations' : 'Manage in Integrations'}
+                          </button>
+                        : deletingAccountId === acc.id
+                          ? <div className="confirm-bar" style={{ margin: 0 }} role="alert">
+                              Delete account?
+                              <button className="btn btn-danger btn-sm" onClick={() => { setDeletingAccountId(null); run(() => calendar.removeCalendarAccount(acc.id)); }}>Delete</button>
+                              <button className="btn btn-secondary btn-sm" onClick={() => setDeletingAccountId(null)}>Cancel</button>
+                            </div>
+                          : <button className="btn btn-danger btn-sm" onClick={() => setDeletingAccountId(acc.id)}>Remove</button>
+                      }
+                    </div>
+                    <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #1e2030' }}>
+                      <div style={{ fontSize: 12, color: '#9499b0', marginBottom: 6 }}>Calendars ({calendar.calendarSources.filter(s => s.accountId === acc.id).length})</div>
+                      {calendar.calendarSources.filter(s => s.accountId === acc.id).map(source => {
+                        // Only local calendars can move, and only to other local accounts.
+                        const otherAccounts = source.googleCalendarId ? [] : calendar.calendarAccounts
+                          .filter(a => a.id !== acc.id && !isGoogleCalendarAccount(a));
+                        return (
+                          <div key={source.id} className="source-toggle" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <label className="toggle">
+                                <input type="checkbox" checked={source.visible} onChange={e => { const visible = e.target.checked; run(() => calendar.updateCalendarSource(source.id, { visible })); }} aria-label={`Toggle ${source.name} calendar`} />
+                                <span className="slider" />
+                              </label>
+                              <span className="dot" style={{ background: source.color }} />
+                              <span>{source.name}</span>
+                              {source.googleCalendarId && <span style={{ fontSize: 10, color: '#8b90a8' }}>(synced)</span>}
+                            </div>
+                            <div className="actions-row">
+                              {otherAccounts.length > 0 && (
+                                movingSourceId === source.id ? (
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                    <span style={{ fontSize: 11, color: '#9499b0' }}>Move to:</span>
+                                    {otherAccounts.map(otherAcc => {
+                                      const pal = accountPaletteMap.get(otherAcc.id) || ACCOUNT_PALETTES[0];
+                                      return (
+                                        <button
+                                          key={otherAcc.id}
+                                          className="btn btn-sm"
+                                          style={{ background: pal.bg, borderColor: pal.border, color: pal.text, fontSize: 11 }}
+                                          onClick={() => {
+                                            setMovingSourceId(null);
+                                            run(() => calendar.updateCalendarSource(source.id, { accountId: otherAcc.id }));
+                                          }}
+                                        >
+                                          {otherAcc.email.split('@')[0]}
+                                        </button>
+                                      );
+                                    })}
+                                    <button className="btn btn-secondary btn-sm" style={{ fontSize: 11 }} onClick={() => setMovingSourceId(null)}>Cancel</button>
+                                  </div>
+                                ) : (
+                                  <button className="btn btn-secondary btn-sm" style={{ fontSize: 11 }} onClick={() => setMovingSourceId(source.id)}>Move</button>
+                                )
+                              )}
+                              {!isGoogleAcc && <button className="btn btn-danger btn-sm" onClick={() => run(() => calendar.removeCalendarSource(source.id))}>Remove</button>}
+                            </div>
+                          </div>
+                        );
+                      })}
+                      {!isGoogleAcc && (
+                        <button className="btn btn-secondary btn-sm" style={{ marginTop: 6 }} onClick={() => run(() => calendar.addCalendarSource({ accountId: acc.id, name: 'New Calendar', color: randomColor(), visible: true }))}>
+                          + Add Calendar
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </>
+        )}
+      </div>
+
+      {/* ── Add/Edit Account Modal ── */}
+      {showAddAccount && (
+        <div className="modal-overlay" onClick={() => setShowAddAccount(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" aria-label={editingAccount ? 'Edit Account' : 'Add Local Calendar Account'}>
+            <h2>{editingAccount ? 'Edit Account' : 'Add Local Calendar Account'}</h2>
+            <div className="info-box">
+              This creates a local calendar. To connect Google Calendar, go to{' '}
+              <button className="btn btn-secondary btn-sm" style={{ padding: '2px 8px', fontSize: 11 }} onClick={() => { setShowAddAccount(false); shell.navigate('integrations'); }}>Integrations</button>.
+            </div>
+            <div className="form-group">
+              <label htmlFor="cal-acc-name">Account Name</label>
+              <input id="cal-acc-name" className="form-input" value={accName} onChange={e => setAccName(e.target.value)} placeholder="e.g., Personal" autoFocus />
+            </div>
+            <div className="form-group">
+              <label htmlFor="cal-acc-email">Email (optional)</label>
+              <input id="cal-acc-email" className="form-input" value={accEmail} onChange={e => setAccEmail(e.target.value)} placeholder="you@example.com" disabled={Boolean(editingAccount)} />
+            </div>
+            {actionError && (
+              <div className="info-box" role="alert" style={{ background: '#3d1a1a', borderColor: '#7f1d1d', color: '#fecaca', fontSize: 11 }}>
+                {actionError}
+              </div>
+            )}
+            <div className="modal-actions">
+              <button className="btn btn-secondary" onClick={() => setShowAddAccount(false)}>Cancel</button>
+              <button className="btn btn-primary" onClick={() => { void saveAccount(); }} disabled={!accName.trim()}>
+                {editingAccount ? 'Save' : 'Add Account'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Add/Edit Event Modal ── */}
+      {showAddEvent && (
+        <div className="modal-overlay" onClick={() => { setShowAddEvent(false); setEventWriteError(null); }}>
+          <div className="modal" onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" aria-label={editingEvent ? 'Edit Event' : 'Add Event'}>
+            <h2>{editingEvent ? 'Edit Event' : 'Add Event'}</h2>
+            {isGoogleSource(evtSourceId) && (
+              <div className="info-box" style={{ background: '#152d1a', borderColor: '#1e4d28', fontSize: 11 }}>
+                This event will be {editingEvent ? 'updated on' : 'created on'} Google Calendar
+                              </div>
+            )}
+            {eventWriteError && (
+              <div className="info-box" role="alert" style={{ background: '#3d1a1a', borderColor: '#7f1d1d', color: '#fecaca', fontSize: 11 }}>
+                {eventWriteError}
+              </div>
+            )}
+            <div className="form-group">
+              <label htmlFor="evt-title">Title</label>
+              <input id="evt-title" className="form-input" value={evtTitle} onChange={e => setEvtTitle(e.target.value)} placeholder="Meeting title" autoFocus />
+            </div>
+            <div className="form-group">
+              <label htmlFor="evt-description">Description</label>
+              <textarea id="evt-description" className="form-input" value={evtDesc} onChange={e => setEvtDesc(e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label htmlFor="evt-location">Location</label>
+              <input id="evt-location" className="form-input" value={evtLocation} onChange={e => setEvtLocation(e.target.value)} placeholder="Optional" />
+            </div>
+            <div className="form-group">
+              <label htmlFor="evt-calendar">Calendar</label>
+              <select id="evt-calendar" className="form-select" value={evtSourceId} onChange={e => { setEvtSourceId(e.target.value); setEventWriteError(null); }}>
+                {(editingEvent ? calendar.calendarSources.filter(s => s.id === editingEvent.sourceId || s.writable !== false) : writableSources).map(s => (
+                  <option key={s.id} value={s.id}>{s.name}{s.googleCalendarId ? ' (Google)' : ''}</option>
+                ))}
+              </select>
+            </div>
+            <div style={{ display: 'flex', gap: 12 }}>
+              <div className="form-group" style={{ flex: 1 }}>
+                <label htmlFor="evt-start">Start</label>
+                <input id="evt-start" className="form-input" type="datetime-local" value={evtStart} onChange={e => setEvtStart(e.target.value)} />
+              </div>
+              <div className="form-group" style={{ flex: 1 }}>
+                <label htmlFor="evt-end">End</label>
+                <input id="evt-end" className="form-input" type="datetime-local" value={evtEnd} onChange={e => setEvtEnd(e.target.value)} />
+              </div>
+            </div>
+            <div className="form-group">
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input type="checkbox" checked={evtAllDay} onChange={e => setEvtAllDay(e.target.checked)} />
+                All day
+              </label>
+            </div>
+            <div className="modal-actions">
+              {editingEvent && (
+                <button className="btn btn-danger" style={{ marginRight: 'auto' }} onClick={() => {
+                  if (deletingEventId === editingEvent.id) void handleDeleteEvent();
+                  else setDeletingEventId(editingEvent.id);
+                }}>
+                  {deletingEventId === editingEvent.id ? 'Confirm Delete' : 'Delete'}
+                </button>
+              )}
+              <button className="btn btn-secondary" onClick={() => { setShowAddEvent(false); setDeletingEventId(null); setEventWriteError(null); }}>Cancel</button>
+              <button className="btn btn-primary" onClick={saveEvent} disabled={!evtTitle.trim() || !evtSourceId || savingEvent}>
+                {savingEvent ? <><span className="spinner" /> Saving...</> : editingEvent ? 'Save' : 'Add Event'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function randomColor(): string {
+  const colors = ['#4f5bff', '#ff6b6b', '#3ab553', '#f0c040', '#c084fc', '#22d3ee', '#fb923c', '#ec4899'];
+  return colors[Math.floor(Math.random() * colors.length)];
+}

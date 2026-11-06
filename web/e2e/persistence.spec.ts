@@ -1,0 +1,274 @@
+import type { Page, Request, Route } from '@playwright/test';
+import { writeFile } from 'node:fs/promises';
+import type { EquityPosition } from '../src/types/domain';
+import { FINANCE_REVIEW } from '../src/test/finance-review-fixture';
+import { SERVICES_BASE_URL } from './support/fake-services';
+import { expect, openApp, test, waitForMutation } from './support/yourlifeone-fixture';
+
+const JOBS_PATH = '/api/life/v1/jobs';
+
+const TASK = {
+  id: 'task-review-notes',
+  title: 'Review notes',
+  description: 'Close the loop on today’s notes.',
+  completed: false,
+  priority: 'medium',
+  category: 'task',
+  dueDate: '2026-08-29',
+  createdAt: '2026-08-29T08:00:00.000Z',
+  updatedAt: '2026-08-29T08:00:00.000Z',
+};
+
+const EQUITY: EquityPosition = {
+  id: 'synthetic-equity', company: 'Example Co', asOf: '2026-09-21', ownedShares: 120,
+  stockPlan: { summary: 'Review owned shares.', status: 'tentative', waitingFor: 'A decision.', nextAction: 'Review the plan.' },
+  optionPlan: { summary: 'Review options.', status: 'undecided', waitingFor: 'Grant terms.', nextAction: 'Read the terms.' },
+  employmentNote: 'Synthetic test position.', grants: [], actions: [], details: [], sources: [],
+  scenario: { pricesUsd: [50], withholdingRate: 0.5, usdToGbp: 0.8, asOf: '2026-09-21', notes: 'Synthetic assumptions.' },
+  createdAt: FINANCE_REVIEW.createdAt, updatedAt: FINANCE_REVIEW.updatedAt,
+};
+
+/** The browser reports being offline (or back online), as when the network drops. */
+async function setBrowserOnline(page: Page, online: boolean): Promise<void> {
+  await page.evaluate(value => {
+    Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => value });
+    window.dispatchEvent(new Event(value ? 'online' : 'offline'));
+  }, online);
+}
+
+test('keeps controls usable when the browser reports offline but the services answer', async ({ page, scenario }, testInfo) => {
+  await scenario({ now: FINANCE_REVIEW.updatedAt, stores: { tasks: [TASK] } });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => false });
+  });
+  await openApp(page);
+  await page.getByRole('button', { name: 'Navigate to Tasks' }).click();
+  const checkbox = page.getByRole('checkbox', { name: 'Mark "Review notes" as complete' });
+  await expect(checkbox).toBeEnabled();
+  await expect(page.getByTestId('sync-status-banner')).toHaveCount(0);
+  expect(await page.evaluate(() => navigator.onLine)).toBe(false);
+
+  const taskWrite = waitForMutation(page, 'tasks');
+  await checkbox.click();
+  expect((await taskWrite).ok()).toBe(true);
+  await expect(page.getByRole('checkbox', { name: 'Mark "Review notes" as incomplete' })).toBeChecked();
+
+  for (const width of [390, 768, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect(page.getByTestId('sync-status-banner')).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath(`synthetic-false-offline-${width}.png`) });
+  }
+});
+
+test('keeps saved Finance data readable while offline, then saves again once back online', async ({ page, scenario }, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  const control = await scenario({
+    now: FINANCE_REVIEW.updatedAt,
+    stores: { tasks: [TASK], financeReviews: [FINANCE_REVIEW], equityPositions: [EQUITY] },
+  });
+  await openApp(page);
+  await page.getByRole('button', { name: 'Navigate to Finance' }).click();
+  const budget = page.getByRole('region', { name: 'Monthly available amount' });
+  await expect(budget).toContainText('£1,750.00 / month');
+
+  // A real disconnection fails network requests as well as changing the browser's hint.
+  const disconnected = (route: Route) => route.abort('internetdisconnected');
+  await page.route(`${SERVICES_BASE_URL}/**`, disconnected);
+  await setBrowserOnline(page, false);
+  const banner = page.getByTestId('sync-status-banner');
+  await expect(banner).toContainText('Offline');
+  await expect(banner).toContainText('Showing your last confirmed data. Your Life One will reconnect automatically.');
+  await expect(budget).toContainText('£1,750.00 / month');
+
+  const evidence = [];
+  for (const width of [390, 768, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.locator('.main-content').evaluate(element => element.scrollTo(0, 0));
+    await expect(banner).toBeVisible();
+    const bannerBox = await banner.boundingBox();
+    const headingBox = await page.getByRole('heading', { name: 'Finance', exact: true }).boundingBox();
+    const headingOverlap = Math.max(0, Math.min(bannerBox!.x + bannerBox!.width, headingBox!.x + headingBox!.width) - Math.max(bannerBox!.x, headingBox!.x))
+      * Math.max(0, Math.min(bannerBox!.y + bannerBox!.height, headingBox!.y + headingBox!.height) - Math.max(bannerBox!.y, headingBox!.y));
+    expect(headingOverlap, `Status banner must not obscure the Finance heading at ${width}px`).toBe(0);
+    const dimensions = await page.evaluate(() => ({
+      client: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth,
+      containers: [...document.querySelectorAll('.sync-status-banner, .main-content, .banking-review')]
+        .filter(element => element.getClientRects().length > 0)
+        .map(element => ({ name: element.className, client: element.clientWidth, scroll: element.scrollWidth })),
+    }));
+    expect(dimensions.scroll).toBe(dimensions.client);
+    for (const container of dimensions.containers) expect(container.scroll, container.name).toBeLessThanOrEqual(container.client + 1);
+    await page.screenshot({ path: testInfo.outputPath(`synthetic-offline-finance-${width}.png`) });
+    evidence.push({ width, headingOverlap, ...dimensions });
+  }
+
+  // Back online, the banner goes and a task completes with one planner-service write.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.unroute(`${SERVICES_BASE_URL}/**`, disconnected);
+  await setBrowserOnline(page, true);
+  await expect(banner).toHaveCount(0);
+  let taskMutationCount = 0;
+  page.on('request', request => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/complete')) taskMutationCount += 1;
+  });
+  await page.getByRole('button', { name: 'Navigate to Tasks' }).click();
+  const taskWrite = waitForMutation(page, 'tasks');
+  await page.getByRole('checkbox', { name: 'Mark "Review notes" as complete' }).click();
+  expect((await taskWrite).ok()).toBe(true);
+  await expect(page.getByRole('checkbox', { name: 'Mark "Review notes" as incomplete' })).toBeChecked();
+  expect(taskMutationCount).toBe(1);
+  expect(control.services.planner.tasks.find(task => task.id === TASK.id)?.completed).toBe(true);
+  const evidencePath = testInfo.outputPath('synthetic-availability-evidence.json');
+  await writeFile(evidencePath, JSON.stringify({
+    environment: 'Synthetic Playwright account and mocked HTTPS services; not live-account acceptance.',
+    taskMutationCount, dimensions: evidence,
+  }, null, 2));
+  await testInfo.attach('synthetic-availability-evidence', { path: evidencePath, contentType: 'application/json' });
+});
+
+test('keeps navigation usable during a stalled Employment load and isolates its failure from task writes', async ({ page, scenario }) => {
+  await scenario({ now: FINANCE_REVIEW.updatedAt, stores: { tasks: [TASK] } });
+  let failLoad = true;
+  let releaseLoad = () => {};
+  const loadReleased = new Promise<void>(resolve => { releaseLoad = resolve; });
+  const isJobsLoad = (request: Request) => request.method() === 'GET' && new URL(request.url()).pathname === JOBS_PATH;
+  // Registered after the scenario's fake services, so it answers first and falls back to them.
+  await page.route(`${SERVICES_BASE_URL}${JOBS_PATH}`, async route => {
+    if (!failLoad || !isJobsLoad(route.request())) {
+      await route.fallback();
+      return;
+    }
+    await loadReleased;
+    // A refusal, not an outage: one response, so the circuit breaker stays closed for the manual retry.
+    await route.fulfill({ status: 400, json: { code: 'bad_request', message: 'Employment load fixture rejected.' } });
+  });
+  const loadRequest = page.waitForRequest(isJobsLoad);
+  await openApp(page);
+  await page.getByRole('button', { name: 'Navigate to Employment' }).click();
+  await loadRequest;
+  await expect(page.getByText('Loading your applications…')).toBeVisible();
+  await page.getByRole('button', { name: 'Navigate to Tasks' }).click();
+  await expect(page.getByRole('checkbox', { name: 'Mark "Review notes" as complete' })).toBeVisible();
+  await page.getByRole('button', { name: 'Navigate to Employment' }).click();
+  await expect(page.getByText('Loading your applications…')).toBeVisible();
+  const loadResponse = page.waitForResponse(response => isJobsLoad(response.request()));
+  releaseLoad();
+  expect((await loadResponse).status()).toBe(400);
+  await expect(page.getByRole('alert')).toContainText('Employment data needs attention: Employment load fixture rejected.');
+  await page.getByRole('button', { name: 'Navigate to Tasks' }).click();
+  const taskWrite = waitForMutation(page, 'tasks');
+  await page.getByRole('checkbox', { name: 'Mark "Review notes" as complete' }).click();
+  expect((await taskWrite).ok()).toBe(true);
+  await expect(page.getByRole('checkbox', { name: 'Mark "Review notes" as incomplete' })).toBeChecked();
+  await expect(page.getByTestId('sync-status-banner')).toHaveCount(0);
+
+  failLoad = false;
+  const loadRetry = page.waitForResponse(response => isJobsLoad(response.request()) && response.ok());
+  // Returning to a failed demanded view retries immediately; no second click is required.
+  await page.getByRole('button', { name: 'Navigate to Employment' }).click();
+  await loadRetry;
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.getByText('Loading your applications…')).toHaveCount(0);
+});
+
+test('persists one shared task mutation through reload', async ({ page, scenario }) => {
+  await scenario({
+    now: '2026-08-29T11:00:00.000Z',
+    stores: { tasks: [TASK] },
+  });
+  await openApp(page);
+  await page.getByRole('button', { name: 'Navigate to Tasks' }).click();
+
+  const checkbox = page.getByRole('checkbox', { name: 'Mark "Review notes" as complete' });
+  await expect(checkbox).toBeVisible();
+
+  const taskWrite = waitForMutation(page, 'tasks');
+  await checkbox.click();
+  await expect(page.getByRole('checkbox', { name: 'Mark "Review notes" as incomplete' })).toBeChecked();
+  await taskWrite;
+
+  await page.reload();
+  await expect(page.getByRole('navigation', { name: 'Main navigation' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Tasks', exact: true })).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: 'Mark "Review notes" as incomplete' })).toBeChecked();
+});
+
+test('persists an account setting through reload', async ({ page, scenario }) => {
+  await scenario({ now: '2026-08-29T11:00:00.000Z' });
+  await openApp(page);
+  await page.getByRole('button', { name: 'Navigate to Settings' }).click();
+
+  const theme = page.getByLabel('Theme');
+  await expect(theme).toHaveValue('dark');
+
+  // App preferences are owned by the profile service.
+  const settingsWrite = page.waitForRequest(request => request.method() === 'PUT'
+    && request.url().endsWith('/api/profile/v1/preferences')
+    && (request.postDataJSON() as { theme: string }).theme === 'light');
+  await theme.selectOption('light');
+  await settingsWrite;
+  await expect(page.getByText('Light theme is not yet available.')).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByRole('navigation', { name: 'Main navigation' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+  await expect(page.getByLabel('Theme')).toHaveValue('light');
+  await expect(page.getByText('Light theme is not yet available.')).toBeVisible();
+});
+
+function waitForProfileSave(page: Page, timeZone: string | null) {
+  return page.waitForRequest(request => request.method() === 'PUT'
+    && request.url().endsWith('/api/profile/v1/settings')
+    && (request.postDataJSON() as { timeZone: string | null }).timeZone === timeZone);
+}
+
+test('validates, persists, reloads, and resets the account app time zone', async ({ page, scenario }) => {
+  await scenario({
+    now: '2026-08-29T11:00:00.000Z',
+    prayer: { timezone: 'Europe/London' },
+    settings: { prayerEnabled: true },
+  });
+  await openApp(page);
+  await page.getByRole('button', { name: 'Navigate to Settings' }).click();
+
+  const timeZone = page.getByLabel('IANA time zone');
+  await timeZone.fill('Not/AZone');
+  await page.getByRole('button', { name: 'Save time zone' }).click();
+  await expect(page.locator('#settings-app-time-zone-status')).toContainText(
+    'Enter a valid IANA time zone',
+  );
+
+  await timeZone.fill('America/New_York');
+  // The display time zone is owned by the profile service.
+  const preferredWrite = waitForProfileSave(page, 'America/New_York');
+  await page.getByRole('button', { name: 'Save time zone' }).click();
+  await preferredWrite;
+  await expect(page.getByText('Saved America/New_York to your account.')).toBeVisible();
+  await expect(page.getByText('Effective zone: America/New_York')).toBeVisible();
+  await expect(page.getByText(
+    'Prayer times remain on Europe/London; app time uses America/New_York.',
+  )).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+  await expect(page.getByLabel('IANA time zone')).toHaveValue('America/New_York');
+  await expect(page.getByText('Effective zone: America/New_York')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Navigate to Dashboard' }).click();
+  await expect(page.getByText(
+    'Prayer schedule: Europe/London · App time: America/New_York',
+  )).toBeVisible();
+  await page.getByRole('button', { name: 'Navigate to Settings' }).click();
+
+  const automaticWrite = waitForProfileSave(page, null);
+  await page.getByRole('button', { name: 'Use Automatic' }).click();
+  await automaticWrite;
+  await expect(page.getByLabel('IANA time zone')).toHaveValue('');
+  await expect(page.getByText(/Automatic restored/)).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+  await expect(page.getByLabel('IANA time zone')).toHaveValue('');
+  await expect(page.getByText('Automatic', { exact: true })).toBeVisible();
+});

@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  maven-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Consumer contracts match the React app
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-consumer-contracts.sh
+      - name: Validate bounded observability configuration
+        run: |
+          scripts/validate-observability.sh
+          python3 scripts/test-observability-pipeline.py
+          python3 scripts/test-observability-pipeline.py --shared-host
+      - name: Validate shared-host monitoring and runtime configuration
+        run: |
+          bash -n infrastructure/digitalocean/collector-network.sh
+          python3 infrastructure/digitalocean/test-mcp-routing.py
+          python3 infrastructure/digitalocean/test-host-routing.py
+          python3 infrastructure/digitalocean/test-host-routing.py --defer-yourlife-frontend
+          docker run --rm -v "$PWD/infrastructure/digitalocean/host-Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.11.4-alpine caddy validate --config /etc/caddy/Caddyfile
+          python3 infrastructure/digitalocean/render-runtime.py
+          git diff --exit-code -- infrastructure/digitalocean/compose.json infrastructure/digitalocean/Caddyfile
+          docker run --rm -v "$PWD/infrastructure/digitalocean/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.11.4-alpine caddy validate --config /etc/caddy/Caddyfile
+          docker run --rm \
+            -e YOUR_LIFE_OTLP_LISTEN=127.0.0.1:4318 -e YOUR_LIFE_HOST=synthetic \
+            -e GRAFANA_OTLP_ENDPOINT=https://example.test -e GRAFANA_OTLP_AUTHORIZATION=synthetic \
+            -e DO_DATABASE_METRICS_USERNAME=synthetic -e DO_DATABASE_METRICS_PASSWORD=synthetic \
+            -e DO_DATABASE_CA_FILE=/etc/ssl/certs/ca-certificates.crt \
+            -v "$PWD/infrastructure/digitalocean:/etc/your-life-one-observability:ro" \
+            grafana/alloy:v1.21.0 validate /etc/your-life-one-observability/collector.alloy
+      - name: Verify all services
+        run: ./mvnw -B -ntp verify
+
+      - name: Check product deployment boundary
+        run: |
+          python3 infrastructure/digitalocean/test-release.py
+          python3 infrastructure/digitalocean/test-frontend-release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yourlife-services
+          path: services/*/target/*-service.jar
+          retention-days: 3
+
+  deploy:
+    name: Deploy Your Life One to DigitalOcean
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: maven-verify
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: yourlife-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: yourlife-services
+          path: release-services
+      - name: Package verified backend artifacts
+        run: |
+          mkdir release-web
+          printf 'Your Life One API' > release-web/index.html
+          python3 infrastructure/digitalocean/pack-release.py release-services release-web release.tar
+      - name: Deploy through the YourLife-only SSH command
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "yourlife-deploy@${DEPLOY_HOST:?}" < release.tar

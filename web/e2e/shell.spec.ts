@@ -1,0 +1,253 @@
+import { expect, openApp, test } from './support/yourlifeone-fixture';
+import { getQuranMotivationForDate, QURAN_MOTIVATION_CARDS } from '../src/services/quranMotivation';
+import { shiftIsoDate } from '../src/services/timeZone';
+import { quranPassageFixture, quranVerseFixture } from './support/fake-quran';
+
+const FIXED_NOW = '2026-07-28T11:45:00.000Z';
+
+for (const width of [320, 390, 768, 1440]) {
+  test(`Grafana Quick links opens the dashboard without leaving Your Life One at ${width}px`, async ({ page, context, scenario }, testInfo) => {
+    await context.route('https://monitoring.example.test/**', route => route.fulfill({
+      contentType: 'text/html',
+      body: '<title>Grafana navigation fixture</title>',
+    }));
+    await page.setViewportSize({ width, height: 900 });
+    await scenario();
+    await openApp(page);
+
+    if (width <= 760) {
+      await page.getByRole('button', { name: 'Open more navigation', exact: true }).click();
+    }
+    const navigation = width <= 760
+      ? page.getByRole('dialog', { name: 'More navigation' })
+      : page.getByRole('navigation', { name: 'Main navigation', exact: true });
+    const link = navigation.getByRole('link', { name: 'Open Grafana dashboard (opens in a new tab)', exact: true });
+    await link.scrollIntoViewIfNeeded();
+    await expect(link).toBeInViewport();
+    await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    await link.focus();
+    await expect(link).toBeFocused();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`grafana-quick-links-${width}.png`) });
+
+    const popupPromise = page.waitForEvent('popup');
+    await page.keyboard.press('Enter');
+    const popup = await popupPromise;
+    await expect(popup).toHaveURL('https://monitoring.example.test/d/your-life-one-services/your-life-one-services3a-api-and-database-latency?from=now-6h&to=now&timezone=browser&refresh=1m');
+    await expect(page.getByRole('main', { name: 'dashboard surface', exact: true })).toBeVisible();
+    await popup.close();
+  });
+}
+
+test('Quran reading uses the English translation returned by Quran.com', async ({ page, scenario }) => {
+  await scenario({ now: '2026-09-30T12:00:00Z' });
+  await openApp(page);
+  const card = page.getByRole('complementary', { name: 'Daily Quran reading' });
+  const passage = getQuranMotivationForDate('2026-09-30');
+  await expect(card.locator('blockquote[lang="en"]')).toHaveText(quranPassageFixture(passage.reference));
+  await expect(card.getByText('English translation: Saheeh International · Quran.com', { exact: true })).toBeVisible();
+});
+
+test('Quran reading keeps Arabic visible and can retry an unavailable English translation', async ({ page, scenario }) => {
+  await scenario({ now: '2026-09-30T12:00:00Z' });
+  let unavailable = true;
+  let recoveredRequests = 0;
+  await page.route(/^https:\/\/api\.quran\.com\/api\/v4\/quran\/translations\/20\?/u, route => {
+    const headers = { 'Access-Control-Allow-Origin': '*' };
+    if (unavailable) return route.fulfill({ status: 503, headers, json: { error: 'Provider unavailable' } });
+    // Keep the outage and recovery in one handler instead of falling through a second route.
+    recoveredRequests += 1;
+    const verseKey = new URL(route.request().url()).searchParams.get('verse_key')!;
+    return route.fulfill({ headers, json: {
+      translations: [{ resource_id: 20, verse_key: verseKey, text: quranVerseFixture(verseKey) }],
+    } });
+  });
+  await openApp(page);
+  const card = page.getByRole('complementary', { name: 'Daily Quran reading' });
+  const passage = getQuranMotivationForDate('2026-09-30');
+  await expect(card.locator('blockquote[lang="ar"]')).toHaveText(passage.arabic);
+  await expect(card.getByRole('alert')).toContainText('English translation unavailable.');
+  await expect(card.getByRole('link', { name: 'Translation source', exact: true }))
+    .toHaveAttribute('href', `${passage.sourceUrl}?translations=20`);
+  unavailable = false;
+  await card.getByRole('button', { name: 'Retry Quran.com translation', exact: true }).click();
+  await expect.poll(() => recoveredRequests).toBeGreaterThan(0);
+  await expect(card.locator('blockquote[lang="en"]')).toHaveText(quranPassageFixture(passage.reference));
+  await expect(card.getByRole('alert')).toHaveCount(0);
+});
+
+for (const width of [390, 768, 1440]) {
+  test(`Quran reading shows complete Arabic and English side by side at ${width}px`, async ({ page, scenario }, testInfo) => {
+    const longest = QURAN_MOTIVATION_CARDS.reduce((left, right) => (
+      quranPassageFixture(left.reference).length > quranPassageFixture(right.reference).length ? left : right
+    ));
+    const date = Array.from({ length: QURAN_MOTIVATION_CARDS.length }, (_, day) => (
+      shiftIsoDate('2026-09-13', day)!
+    )).find(candidate => getQuranMotivationForDate(candidate).id === longest.id)!;
+    await page.setViewportSize({ width, height: 900 });
+    await scenario({ now: `${date}T12:00:00Z` });
+    await openApp(page);
+    const card = page.getByRole('complementary', { name: 'Daily Quran reading' });
+    await card.scrollIntoViewIfNeeded();
+    await expect(card.getByRole('heading')).toHaveText(`Quran ${longest.reference}`);
+    const arabic = card.locator('blockquote[lang="ar"]');
+    const english = card.locator('blockquote[lang="en"]');
+    await expect(arabic).toHaveText(longest.arabic);
+    await expect(arabic).toHaveAttribute('dir', 'rtl');
+    await expect(english).toHaveText(quranPassageFixture(longest.reference));
+    await expect(english).toHaveAttribute('dir', 'ltr');
+    const arabicBounds = await arabic.boundingBox();
+    const englishBounds = await english.boundingBox();
+    expect(arabicBounds!.x).toBeGreaterThanOrEqual(englishBounds!.x + englishBounds!.width);
+    expect(Math.abs(arabicBounds!.y - englishBounds!.y)).toBeLessThan(1);
+    await expect(card.getByText('English translation: Saheeh International · Quran.com', { exact: true })).toBeVisible();
+    await expect(card.getByText('Reviewed meaning (paraphrase):', { exact: false })).toHaveCount(0);
+    await expect(card.getByRole('link', { name: 'Arabic: Tanzil Project', exact: true }))
+      .toHaveAttribute('href', 'https://tanzil.net');
+    await expect(card.getByRole('link', { name: `Quran ${longest.reference} · Source`, exact: true }))
+      .toHaveAttribute('href', `${longest.sourceUrl}?translations=20`);
+    expect(await card.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await card.screenshot({ path: testInfo.outputPath(`quran-long-${width}.png`) });
+    const source = card.getByRole('link', { name: 'Translation source', exact: true });
+    await expect(source).toHaveAttribute('href', `${longest.sourceUrl}?translations=20`);
+    await source.scrollIntoViewIfNeeded();
+    await expect(source).toBeInViewport();
+    await source.click({ trial: true });
+    await page.screenshot({ path: testInfo.outputPath(`quran-sources-${width}.png`) });
+  });
+}
+
+test('Quran reading stays stable on reload and changes with the prayer date', async ({ page, scenario }) => {
+  await scenario({ now: '2026-09-30T22:59:00Z', prayer: { timezone: 'Europe/London' }, settings: { prayerEnabled: true } });
+  await openApp(page);
+  const card = page.getByRole('complementary', { name: 'Daily Quran reading' });
+  const passage = card.locator('blockquote[lang="en"]');
+  const arabic = card.locator('blockquote[lang="ar"]');
+  await expect(passage).toHaveText(quranPassageFixture(getQuranMotivationForDate('2026-09-30').reference));
+  await expect(arabic).toHaveText(getQuranMotivationForDate('2026-09-30').arabic);
+  await page.reload();
+  await expect(passage).toHaveText(quranPassageFixture(getQuranMotivationForDate('2026-09-30').reference));
+  await expect(arabic).toHaveText(getQuranMotivationForDate('2026-09-30').arabic);
+  await page.clock.fastForward(120_000);
+  await expect(passage).toHaveText(quranPassageFixture(getQuranMotivationForDate('2026-10-01').reference));
+  await expect(arabic).toHaveText(getQuranMotivationForDate('2026-10-01').arabic);
+});
+
+for (const width of [1440, 390]) {
+  test(`the removed Partner assistant stays out of navigation, Settings and Debug at ${width}px`, async ({ page, scenario }, testInfo) => {
+    // Chat, Partner, voice, hosted AI and Life Hero were removed. A stored `chat` surface and old
+    // settings from earlier releases must be tolerated and ignored.
+    await scenario({ initialSurface: 'chat' as never, settings: { assistantEnabled: true, wakeWordEnabled: true, lifeHeroEnabled: true } });
+    const deprecatedCalls: string[] = [];
+    page.on('request', request => {
+      if (/\/functions\/v1\/(assistant-openai|assistant-speech|github-life-hero)|life_hero|:11434\//u.test(request.url())) deprecatedCalls.push(request.url());
+    });
+    await page.setViewportSize({ width, height: 900 });
+    await openApp(page);
+    await expect(page.getByRole('main', { name: 'dashboard surface', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Navigate to Chat', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /Partner/u })).toHaveCount(0);
+    await expect(page.getByLabel('Life Hero companion')).toHaveCount(0);
+    if (width === 390) {
+      await page.getByRole('button', { name: 'Open more navigation', exact: true }).click();
+      const more = page.getByRole('dialog', { name: 'More navigation' });
+      await expect(more.getByRole('button', { name: 'Chat', exact: true })).toHaveCount(0);
+      await more.getByRole('button', { name: 'Settings', exact: true }).click();
+    } else {
+      await page.getByRole('button', { name: 'Navigate to Settings', exact: true }).click();
+    }
+    await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+    for (const heading of ['Life Hero', 'Voice Assistant (Partner)', 'Local AI (Ollama)']) {
+      await expect(page.getByRole('heading', { name: heading, exact: true })).toHaveCount(0);
+    }
+    await expect(page.getByLabel('Microphone')).toHaveCount(0);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.getByRole('button', { name: 'Navigate to Debug', exact: true }).click();
+    await page.setViewportSize({ width, height: 900 });
+    for (const tab of ['Wake Word', 'AI Assistant', 'Audio Pipeline']) {
+      await expect(page.getByRole('button', { name: new RegExp(tab, 'u') })).toHaveCount(0);
+    }
+    await expect(page.getByRole('button', { name: /Network \/ APIs/u })).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`removed-assistant-absent-${width}.png`) });
+    expect(deprecatedCalls).toEqual([]);
+  });
+}
+
+test.describe('assembled browser shell', () => {
+  test('More contains keyboard focus, scrolls and returns focus on dismissal', async ({ page, scenario }, testInfo) => {
+    await page.setViewportSize({ width: 390, height: 600 });
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await scenario();
+    await openApp(page);
+    const trigger = page.getByRole('button', { name: 'Open more navigation', exact: true });
+    await trigger.focus();
+    await page.keyboard.press('Enter');
+    const dialog = page.getByRole('dialog', { name: 'More navigation' });
+    const close = dialog.getByRole('button', { name: 'Close more navigation' });
+    await expect(close).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(dialog.getByRole('button').last()).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(close).toBeFocused();
+    const size = await dialog.evaluate(element => ({ client: element.clientHeight, scroll: element.scrollHeight }));
+    expect(size.scroll).toBeGreaterThan(size.client);
+    await dialog.hover();
+    await page.mouse.wheel(0, 700);
+    await expect.poll(() => dialog.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+    await page.keyboard.press('Escape');
+    await expect(dialog).toBeHidden();
+    await expect(trigger).toBeFocused();
+    await page.keyboard.press('Space');
+    await expect(close).toBeFocused();
+    await page.screenshot({ path: testInfo.outputPath('more-390.png') });
+    await close.click();
+    await expect(trigger).toBeFocused();
+    await page.keyboard.press('Enter');
+    const clock = dialog.getByRole('button', { name: 'Clock', exact: true });
+    await clock.focus();
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('main', { name: 'clock surface' })).toBeVisible();
+    await expect(trigger).toBeFocused();
+  });
+
+  test('boots Night Compass with a current-day prayer schedule and next-prayer semantics', async ({ page, scenario }) => {
+    await scenario({
+      now: FIXED_NOW,
+      settings: {
+        prayerEnabled: true,
+        prayerCity: 'Bedford',
+        prayerCountry: 'United Kingdom',
+      },
+    });
+    await openApp(page);
+
+    await expect(page.getByRole('heading', { name: 'Night Compass' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Prayer', exact: true })).toBeVisible();
+
+    const nextPrayer = page.getByRole('button', { name: 'Complete Dhuhr Prayer' });
+    await expect(nextPrayer).toContainText('13:00');
+    await expect(nextPrayer).toHaveAttribute('aria-current', 'true');
+  });
+
+  test('navigates across the core account surfaces', async ({ page, scenario }) => {
+    await scenario();
+    await openApp(page);
+
+    await page.getByRole('button', { name: 'Navigate to Tasks' }).click();
+    await expect(page.getByRole('heading', { name: 'Tasks', exact: true })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Navigate to Calendar' }).click();
+    await expect(page.getByRole('heading', { name: 'Calendar', exact: true })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Navigate to Clock' }).click();
+    await expect(page.getByRole('heading', { name: 'Clock', exact: true })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Navigate to Settings' }).click();
+    await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Navigate to Dashboard' }).click();
+    await expect(page.getByRole('heading', { name: 'Night Compass', exact: true })).toBeVisible();
+  });
+});

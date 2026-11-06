@@ -1,0 +1,74 @@
+server:
+  forward-headers-strategy: framework
+  port: ${PORT:8080}
+  servlet:
+    context-path: /api/access
+    session:
+      timeout: 7d
+      cookie:
+        name: ${APP_ACCESS_SESSION_COOKIE_NAME:YOUR_LIFE_ONE_SESSION}
+        path: /api/access
+        secure: true
+        http-only: true
+        same-site: lax
+        max-age: 7d
+
+spring:
+  application:
+    name: access-service
+  ai:
+    mcp:
+      server:
+        name: your-life-one
+        version: 0.1.0
+        protocol: STATELESS
+        type: SYNC
+        stdio: false
+        capabilities:
+          tool: true
+          resource: false
+          prompt: false
+          completion: false
+  datasource:
+    hikari:
+      maximum-pool-size: 2
+      minimum-idle: 1
+      schema: identity
+      data-source-properties:
+        sslmode: ${APP_DATASOURCE_SSLMODE:verify-full}
+  flyway:
+    schemas: identity
+    default-schema: identity
+    locations: classpath:db/migration/identity
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  session:
+    jdbc:
+      initialize-schema: never
+      table-name: identity.spring_session
+  security:
+    oauth2:
+      client:
+        registration:
+          google:
+            client-id: ${GOOGLE_OAUTH_CLIENT_ID}
+            client-secret: ${GOOGLE_OAUTH_CLIENT_SECRET}
+            scope: openid,email,profile
+            redirect-uri: ${APP_ACCESS_PUBLIC_URL}/login/oauth2/code/google
+
+app:
+  access:
+    public-url: ${APP_ACCESS_PUBLIC_URL}
+    browser-url: ${APP_ACCESS_BROWSER_URL}
+    allowed-origins: ${APP_CORS_ALLOWED_ORIGINS}
+    signing-keys: ${APP_ACCESS_SIGNING_KEYS}
+    signing-key-id: ${APP_ACCESS_SIGNING_KEY_ID}
+    audience: authenticated
+    access-token-lifetime: 10m
+
+logging:
+  structured:
+    format:
+      console: ecs

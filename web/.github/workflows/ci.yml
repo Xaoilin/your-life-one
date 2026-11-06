@@ -1,0 +1,507 @@
+name: CI
+
+run-name: >-
+  ${{ inputs.source_run_id != '' &&
+      format('CI receipt source {0} tree {1}', inputs.source_run_id, inputs.tested_tree) ||
+      github.event.pull_request.title ||
+      format('CI {0}', github.ref_name) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tested_tree:
+        description: Exact pull request merge-tree validated by the source CI run
+        required: false
+        type: string
+      source_run_id:
+        description: Successful pull request CI run that produced the tree receipt
+        required: false
+        type: string
+      source_pr:
+        description: Pull request number associated with the source CI run
+        required: false
+        type: string
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: >-
+    ci-${{ github.workflow }}-${{
+      github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id
+    }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  lint:
+    name: lint
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' ||
+        (inputs.tested_tree == '' && inputs.source_run_id == '' && inputs.source_pr == ''))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  agent-policy:
+    name: agent-policy
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' ||
+        (inputs.tested_tree == '' && inputs.source_run_id == '' && inputs.source_pr == ''))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run agent:policy
+
+  typecheck:
+    name: typecheck
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' ||
+        (inputs.tested_tree == '' && inputs.source_run_id == '' && inputs.source_pr == ''))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  unit:
+    name: unit
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' ||
+        (inputs.tested_tree == '' && inputs.source_run_id == '' && inputs.source_pr == ''))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test -- --config vite.config.ts
+      - name: Exercise bounded availability monitor
+        run: node --test scripts/test-availability-monitor.mjs
+      - name: Exercise Finance MCP runtime contract
+        run: DENO_NO_PACKAGE_JSON=1 npx --yes deno@2.9.6 test --no-config --no-lock --node-modules-dir=none --allow-env supabase/functions/your-life-one-finance-mcp/index_test.ts
+      - name: Exercise Equity MCP runtime contract
+        run: DENO_NO_PACKAGE_JSON=1 npx --yes deno@2.9.6 test --no-config --no-lock --node-modules-dir=none --allow-env supabase/functions/your-life-one-equity-mcp/index_test.ts
+      - name: Exercise Employment MCP runtime contract
+        run: DENO_NO_PACKAGE_JSON=1 npx --yes deno@2.9.6 test --no-config --no-lock --node-modules-dir=none --allow-env supabase/functions/your-life-one-employment-mcp/index_test.ts
+      - name: Exercise Inventory MCP runtime contract
+        run: DENO_NO_PACKAGE_JSON=1 npx --yes deno@2.9.6 test --no-config --no-lock --node-modules-dir=none --allow-env supabase/functions/your-life-one-inventory-mcp/index_test.ts
+      - name: Test bounded edge observability
+        run: DENO_NO_PACKAGE_JSON=1 npx --yes deno@2.9.6 test --no-config --no-lock --node-modules-dir=none --allow-env supabase/functions/_shared/observability_test.ts
+      - name: Verify all four MCP access-only request contracts
+        run: DENO_NO_PACKAGE_JSON=1 npx --yes deno@2.9.6 test --no-config --no-lock --node-modules-dir=none --allow-env supabase/functions/_shared/accessProbes_test.ts
+      - name: Test the private prayer-provider relay
+        run: DENO_NO_PACKAGE_JSON=1 npx --yes deno@2.9.6 test --no-config --no-lock --node-modules-dir=none --allow-env supabase/functions/your-life-one-prayer-provider/handler_test.ts
+      - name: Check Jev voice Edge Function runtime
+        run: DENO_NO_PACKAGE_JSON=1 npx --yes deno@2.9.6 check --no-config --no-lock --node-modules-dir=none supabase/functions/your-life-one-jev-voice/index.ts
+
+  e2e:
+    name: e2e
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' ||
+        (inputs.tested_tree == '' && inputs.source_run_id == '' && inputs.source_pr == ''))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install Firefox
+        run: npx playwright install --with-deps firefox
+      - name: Run blocking E2E portfolio
+        run: npm run test:e2e -- --fully-parallel --workers=2 --reporter=line
+
+  build:
+    name: build
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' ||
+        (inputs.tested_tree == '' && inputs.source_run_id == '' && inputs.source_pr == ''))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+        env:
+          VITE_ELEVENLABS_API_KEY: KAN305_SYNTHETIC_ELEVENLABS_MUST_NOT_BUNDLE
+          VITE_DEEPGRAM_API_KEY: KAN305_SYNTHETIC_DEEPGRAM_MUST_NOT_BUNDLE
+          VITE_MONZO_ACCESS_TOKEN: KAN305_SYNTHETIC_MONZO_MUST_NOT_BUNDLE
+
+  database:
+    name: database
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' ||
+        (inputs.tested_tree == '' && inputs.source_run_id == '' && inputs.source_pr == ''))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Start isolated Supabase Postgres
+        run: npx supabase db start
+      - name: Verify Your Life One migrations, RLS, concurrency semantics, and legacy preservation
+        run: npm run test:database
+      - name: Stop isolated Supabase Postgres
+        # Successful GitHub-hosted runners are discarded; retain cleanup only
+        # for failures so diagnostics/retries do not inherit local state.
+        if: failure()
+        run: npx supabase stop --no-backup
+
+  receipt:
+    name: receipt
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.tested_tree != '' || inputs.source_run_id != '' || inputs.source_pr != '')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: yourlifeone-auto-promote-master
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Wait briefly for source CI completion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PR: ${{ inputs.source_pr }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          TESTED_TREE: ${{ inputs.tested_tree }}
+        run: node ./scripts/verify-ci-receipt.mjs wait
+      - name: Download source merge-tree record
+        uses: actions/download-artifact@v5
+        with:
+          name: ci-tested-tree
+          path: test-results/ci-receipt
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.source_run_id }}
+      - id: verify
+        name: Verify exact-tree CI receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PR: ${{ inputs.source_pr }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          TESTED_TREE: ${{ inputs.tested_tree }}
+        run: node ./scripts/verify-ci-receipt.mjs verify
+      - name: Trigger deploy workflows after verified receipt
+        env:
+          DEPLOY_SHA: ${{ steps.verify.outputs.verified_sha }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        # GITHUB_TOKEN-dispatched CI does not cascade into workflow_run,
+        # so the verified receipt explicitly starts each pinned deploy once.
+        run: node ./scripts/verify-ci-receipt.mjs dispatch-deploys
+
+  codex-review:
+    name: codex-review
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+      - name: Pre-fetch pull request refs
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags origin \
+            "$PR_BASE_REF" \
+            "+$PR_HEAD_SHA:refs/pull/$PR_NUMBER/head"
+          test "$(git rev-parse "refs/pull/$PR_NUMBER/head")" = "$PR_HEAD_SHA"
+      - name: Check Codex review availability
+        id: codex_review_secret
+        env:
+          CODEX_API_REVIEW_ENABLED: ${{ vars.CODEX_API_REVIEW_ENABLED == 'true' && 'true' || 'false' }}
+          OPENAI_API_KEY: ${{ vars.CODEX_API_REVIEW_ENABLED == 'true' && secrets.OPENAI_API_KEY || '' }}
+        run: |
+          if [ "$CODEX_API_REVIEW_ENABLED" != "true" ]; then
+            echo "API-funded review is disabled. Source review is performed in Codex before promotion."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          elif [ -z "$OPENAI_API_KEY" ]; then
+            echo "::warning::OPENAI_API_KEY is not configured; skipping advisory Codex review."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Prepare review output directory
+        run: mkdir -p test-results
+      - name: Run Codex review gate
+        id: run_codex_review
+        if: steps.codex_review_secret.outputs.available == 'true'
+        continue-on-error: true
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: gpt-5.4-mini
+          effort: low
+          sandbox: read-only
+          safety-strategy: read-only
+          output-file: test-results/codex-review.json
+          output-schema: |
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "findings": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "priority": {
+                        "type": "string",
+                        "enum": ["P0", "P1", "P2", "P3"]
+                      },
+                      "file": {
+                        "type": "string"
+                      },
+                      "line": {
+                        "type": "integer"
+                      },
+                      "title": {
+                        "type": "string"
+                      },
+                      "body": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["priority", "file", "line", "title", "body"]
+                  }
+                }
+              },
+              "required": ["findings"]
+            }
+          prompt: |
+            This is PR #${{ github.event.pull_request.number }} for ${{ github.repository }}.
+            Review only the changes introduced by this pull request.
+
+            Base SHA: ${{ github.event.pull_request.base.sha }}
+            Head SHA: ${{ github.event.pull_request.head.sha }}
+
+            Use these commands for context:
+            - git diff --stat ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+            - git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+
+            Apply Your Life One's AGENTS.md and docs/engineering-guide.md review rules.
+            Flag only actionable issues introduced by the PR.
+            Use priorities:
+            - P0: must not merge; data loss, secret leak, severe security issue, or broken release automation.
+            - P1: should not merge; likely runtime break, broken tests, unsafe persistence/auth/sync behavior, or incorrect deployment gate.
+            - P2: non-blocking but important improvement.
+            - P3: minor maintainability issue.
+
+            Return JSON matching the requested schema. If there are no findings, return {"findings":[]}.
+      - name: Summarize advisory Codex review result
+        if: always()
+        env:
+          CODEX_ACTION_OUTCOME: ${{ steps.run_codex_review.outcome }}
+          CODEX_SECRET_AVAILABLE: ${{ steps.codex_review_secret.outputs.available }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+
+          const reviewPath = 'test-results/codex-review.json'
+          const secretAvailable = process.env.CODEX_SECRET_AVAILABLE === 'true'
+          const actionOutcome = process.env.CODEX_ACTION_OUTCOME || 'skipped'
+
+          if (!secretAvailable) {
+            console.log('API-funded Codex review skipped: disabled by default or credential unavailable; no automated review result is claimed.')
+            process.exit(0)
+          }
+
+          if (!fs.existsSync(reviewPath)) {
+            console.warn(`::warning::Codex review did not produce output (action outcome: ${actionOutcome}); treating review as advisory unavailable.`)
+            process.exit(0)
+          }
+
+          const raw = fs.readFileSync(reviewPath, 'utf8').trim()
+          const withoutFence = raw
+            .replace(/^```(?:json)?\s*/u, '')
+            .replace(/\s*```$/u, '')
+            .trim()
+
+          let parsed
+          try {
+            parsed = JSON.parse(withoutFence)
+          } catch {
+            const start = withoutFence.indexOf('{')
+            const end = withoutFence.lastIndexOf('}')
+            if (start === -1 || end === -1 || end <= start) {
+              console.warn('::warning::Codex review did not produce parseable JSON; treating review as advisory unavailable.')
+              process.exit(0)
+            }
+            try {
+              parsed = JSON.parse(withoutFence.slice(start, end + 1))
+            } catch {
+              console.warn('::warning::Codex review JSON parse fallback failed; treating review as advisory unavailable.')
+              process.exit(0)
+            }
+          }
+
+          const findings = Array.isArray(parsed.findings) ? parsed.findings : []
+          const blocking = findings.filter((finding) => finding.priority === 'P0' || finding.priority === 'P1')
+
+          if (blocking.length > 0) {
+            console.error('Codex review found blocking issues:')
+            for (const finding of blocking) {
+              console.error(`- ${finding.priority} ${finding.file}:${finding.line} ${finding.title}`)
+              console.error(`  ${finding.body}`)
+            }
+            process.exit(1)
+          }
+
+          console.log(`Codex review passed with ${findings.length} non-blocking finding(s).`)
+          NODE
+
+  auto-promote:
+    name: auto-promote
+    # `always()` allows explicit direct-result guards to keep promotion fail closed.
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == 'master' &&
+      needs.lint.result == 'success' &&
+      needs['agent-policy'].result == 'success' &&
+      needs.typecheck.result == 'success' &&
+      needs.unit.result == 'success' &&
+      needs.e2e.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.database.result == 'success' &&
+      needs['codex-review'].result == 'success'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: yourlifeone-auto-promote-master
+      cancel-in-progress: false
+      queue: max
+    needs:
+      - lint
+      - agent-policy
+      - typecheck
+      - unit
+      - e2e
+      - build
+      - database
+      - codex-review
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - id: record
+        name: Record exact pull request merge-tree
+        env:
+          SOURCE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SOURCE_PR: ${{ github.event.pull_request.number }}
+        run: node ./scripts/verify-ci-receipt.mjs record
+      - name: Publish tested merge-tree record
+        uses: actions/upload-artifact@v5
+        with:
+          name: ci-tested-tree
+          path: test-results/ci-receipt/source-tree.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+      - id: merge_state
+        name: Check for an already verified squash merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PR: ${{ github.event.pull_request.number }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          TESTED_TREE: ${{ steps.record.outputs.tested_tree }}
+        run: node ./scripts/verify-ci-receipt.mjs merge-state
+      - name: Revalidate tested tree immediately before merge
+        if: steps.merge_state.outputs.already_merged != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PR: ${{ github.event.pull_request.number }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          TESTED_TREE: ${{ steps.record.outputs.tested_tree }}
+        run: node ./scripts/verify-ci-receipt.mjs pre-merge
+      - name: Squash merge validated codex branch
+        if: steps.merge_state.outputs.already_merged != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SOURCE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          TESTED_TREE: ${{ steps.record.outputs.tested_tree }}
+        run: |
+          pr_title="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json title --jq .title)"
+          gh pr merge "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --squash \
+            --delete-branch \
+            --match-head-commit "$SOURCE_HEAD_SHA" \
+            --subject "$pr_title (#$PR_NUMBER)"
+      - id: merged_tree
+        name: Verify resulting master tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PR: ${{ github.event.pull_request.number }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          TESTED_TREE: ${{ steps.record.outputs.tested_tree }}
+        run: node ./scripts/verify-ci-receipt.mjs merged-tree
+      # The GITHUB_TOKEN squash does not trigger the push workflow. Dispatch
+      # only the exact-tree receipt; direct user pushes still run the full suite.
+      - name: Trigger exact-tree master verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PR: ${{ github.event.pull_request.number }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          TESTED_TREE: ${{ steps.record.outputs.tested_tree }}
+        run: node ./scripts/verify-ci-receipt.mjs dispatch-receipt

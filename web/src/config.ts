@@ -1,0 +1,69 @@
+/**
+ * App configuration — developer-managed, baked into the build.
+ * End users should never need to configure these.
+ *
+ * VITE values are public. Use static property reads so Vite includes only the
+ * explicitly referenced public settings. Provider values belong in Vault.
+ * Supabase account configuration is never device-configured.
+ */
+
+function getSettingsValue(key: 'googleOAuthClientId'): string {
+  try {
+    const raw = localStorage.getItem('yourlifeone:device:deviceSettings:v2') || localStorage.getItem('yourlifeone:device:deviceSettings');
+    if (!raw) return '';
+    const settings = JSON.parse(raw);
+    return settings?.[key] || '';
+  } catch { return ''; }
+}
+
+/** Native product sign-in and agent authorization service. */
+export const ACCESS_BACKEND_URL = import.meta.env.VITE_ACCESS_API_BASE_URL || '';
+
+/** Optional Spring Boot prayer-service base URL. */
+export const PRAYER_BACKEND_URL = import.meta.env.VITE_PRAYER_API_BASE_URL || '';
+
+/** Optional Spring Boot profile-service base URL (global settings such as location). */
+export const PROFILE_BACKEND_URL = import.meta.env.VITE_PROFILE_API_BASE_URL || '';
+
+/** Optional Spring Boot calendar-service base URL. */
+export const CALENDAR_BACKEND_URL = import.meta.env.VITE_CALENDAR_API_BASE_URL || '';
+
+/** Optional Spring Boot life admin service base URL (inventory, trips, health and jobs). */
+export const LIFE_BACKEND_URL = import.meta.env.VITE_LIFE_API_BASE_URL || '';
+
+/** Optional Spring Boot knowledge service base URL (knowledge base, lifestyle tracker and projects). */
+export const KNOWLEDGE_BACKEND_URL = import.meta.env.VITE_KNOWLEDGE_API_BASE_URL || '';
+
+/** Optional Spring Boot planner service base URL (tasks, habits, goals, XP, daily momentum and the clock). */
+export const PLANNER_BACKEND_URL = import.meta.env.VITE_PLANNER_API_BASE_URL || '';
+
+/**
+ * Optional Spring Boot finance service base URL (manual accounts, transactions, budgets, savings goals, the
+ * banking review and equity positions).
+ */
+export const FINANCE_BACKEND_URL = import.meta.env.VITE_FINANCE_API_BASE_URL || '';
+
+/**
+ * Where the live-update gateway runs: on every server that hosts a service, each streaming its own
+ * services' changes. One stream per distinct API base, preserving a product path prefix.
+ */
+export function liveGatewayOrigins(): string[] {
+  const urls = [PRAYER_BACKEND_URL, PROFILE_BACKEND_URL, CALENDAR_BACKEND_URL, LIFE_BACKEND_URL,
+    KNOWLEDGE_BACKEND_URL, PLANNER_BACKEND_URL, FINANCE_BACKEND_URL];
+  const origins = new Set<string>();
+  for (const url of urls) {
+    try {
+      if (url.trim()) {
+        const base = new URL(url.trim());
+        origins.add(`${base.origin}${base.pathname.replace(/\/+$/u, '')}`);
+      }
+    } catch {
+      // A malformed URL has no gateway to reach; its service reports its own error.
+    }
+  }
+  return [...origins];
+}
+
+/** Google OAuth Client ID for Calendar integration. */
+export const GOOGLE_OAUTH_CLIENT_ID = (import.meta.env.VITE_GOOGLE_OAUTH_CLIENT_ID || '') || getSettingsValue('googleOAuthClientId');
+

@@ -1,0 +1,6 @@
+# Test-only overrides, loaded on top of src/main/resources/application.yml.
+app:
+  calendar:
+    google-credential:
+      # A throwaway key for tests; production generates its own on the server.
+      key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=

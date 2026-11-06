@@ -1,0 +1,82 @@
+import { expect, openApp, test } from './support/yourlifeone-fixture';
+
+for (const width of [320, 768, 1440]) {
+  test(`Software navigation and native Mac launch at ${width}px`, async ({ page, context, scenario }, testInfo) => {
+    await page.setViewportSize({ width, height: 900 });
+    await scenario();
+    await openApp(page);
+    if (width <= 760) {
+      await page.getByRole('button', { name: 'Open more navigation', exact: true }).click();
+    }
+    const navigation = width <= 760
+      ? page.getByRole('dialog', { name: 'More navigation' })
+      : page.getByRole('navigation', { name: 'Main navigation', exact: true });
+    const software = navigation.getByRole('button', { name: width <= 760 ? 'Software' : 'Navigate to Software', exact: true });
+    await software.focus();
+    await page.keyboard.press('Enter');
+    const surface = page.getByRole('main', { name: 'software surface', exact: true });
+    await expect(surface.getByRole('heading', { name: 'Software', exact: true })).toBeVisible();
+    const cameraZoom = surface.getByRole('article', { name: 'Camera Zoom', exact: true });
+    await expect(cameraZoom).toBeVisible();
+    const cameraRepository = cameraZoom.getByRole('link', { name: 'Camera Zoom on GitHub' });
+    await expect(cameraRepository).toHaveAttribute('href', 'https://example.com/repositories/camera-zoom');
+    await expect(cameraRepository).toHaveAttribute('rel', 'noopener noreferrer');
+    await expect(cameraZoom.getByText('Open the installed Camera Zoom app from your taskbar.', { exact: false })).toBeVisible();
+    await expect(cameraZoom.getByRole('link', { name: 'Launch on Mac', exact: true })).toHaveCount(0);
+    const autoclicker = surface.getByRole('article', { name: 'Autoclicker', exact: true });
+    await expect(autoclicker.getByText('Repository pending', { exact: true })).toHaveCount(0);
+    const launch = autoclicker.getByRole('link', { name: 'Launch on Mac', exact: true });
+    await expect(launch).toHaveAttribute('href', 'yourlife-autoclicker://open');
+    await expect(launch).not.toHaveAttribute('target', '_blank');
+    await expect(autoclicker.getByRole('link', { name: 'Autoclicker on GitHub' })).toHaveAttribute('href', 'https://example.com/repositories/autoclicker');
+    await expect(autoclicker.getByRole('link', { name: 'Download Autoclicker' })).toHaveAttribute('href', 'https://example.com/repositories/autoclicker/releases/latest/download/YourLife-Autoclicker-macOS.zip');
+    // The OS dialog belongs to native live acceptance. Avoid opening local apps from CI.
+    await launch.evaluate(element => element.addEventListener('click', event => event.preventDefault()));
+    await launch.focus();
+    await page.keyboard.press('Enter');
+    await expect(autoclicker.getByRole('status')).toContainText('If nothing opens, download and install it first.');
+    const kitab = surface.getByRole('article', { name: 'Kitab', exact: true });
+    await expect(kitab).toBeVisible();
+    const kitabSite = kitab.getByRole('link', { name: 'Open Kitab' });
+    await expect(kitabSite).toHaveAttribute('href', 'https://your-life-one.example/kitab/');
+    await expect(kitabSite).toHaveAttribute('target', '_blank');
+    await expect(kitabSite).toHaveAttribute('rel', 'noopener noreferrer');
+    await expect(kitab.getByRole('link', { name: 'Kitab on GitHub' })).toHaveAttribute('href', 'https://example.com/repositories/kitab');
+    await expect(kitab.getByRole('link', { name: 'Launch on Mac', exact: true })).toHaveCount(0);
+    await expect(kitab.getByRole('link', { name: 'Download Kitab' })).toHaveCount(0);
+    const netscope = surface.getByRole('article', { name: 'NetScope', exact: true });
+    await expect(netscope).toBeVisible();
+    await expect(netscope.getByRole('link', { name: 'NetScope on GitHub' })).toHaveAttribute('href', 'https://example.com/repositories/mac-network-activity');
+    const netscopeDownload = netscope.getByRole('link', { name: 'Download NetScope' });
+    await expect(netscopeDownload).toHaveAttribute('href', 'https://example.com/repositories/mac-network-activity/releases/latest/download/NetScope-macOS-arm64.zip');
+    await expect(netscopeDownload).toHaveAttribute('target', '_blank');
+    await expect(netscopeDownload).toHaveAttribute('rel', 'noopener noreferrer');
+    await expect(netscope.getByText('Install NetScope 1.0.1 or later:', { exact: false })).toBeVisible();
+    const netscopeLaunch = netscope.getByRole('link', { name: 'Launch on Mac', exact: true });
+    await expect(netscopeLaunch).toHaveAttribute('href', 'yourlife-netscope://open');
+    await expect(netscopeLaunch).not.toHaveAttribute('target', '_blank');
+    // Native launch acceptance belongs to the installed app, not the CI browser.
+    await netscopeLaunch.evaluate(element => element.addEventListener('click', event => event.preventDefault()));
+    await netscopeLaunch.focus();
+    await page.keyboard.press('Enter');
+    await expect(netscope.getByRole('status')).toContainText('If nothing opens, download and install it first.');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await netscope.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath(`software-${width}.png`) });
+
+    await context.route('https://example.com/repositories?tab=repositories', route => route.fulfill({
+      contentType: 'text/html', body: '<title>GitHub repositories fixture</title>',
+    }));
+    const github = surface.getByRole('link', { name: 'GitHub repositories', exact: true });
+    await expect(github).toHaveAttribute('rel', 'noopener noreferrer');
+    await github.focus();
+    const popupPromise = page.waitForEvent('popup');
+    await page.keyboard.press('Enter');
+    const popup = await popupPromise;
+    await expect(popup).toHaveURL('https://example.com/repositories?tab=repositories');
+    await expect(surface).toBeVisible();
+    await popup.close();
+    await page.reload();
+    await expect(surface.getByRole('heading', { name: 'Software', exact: true })).toBeVisible();
+  });
+}

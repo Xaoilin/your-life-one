@@ -1,0 +1,366 @@
+import './App.css';
+import { lazy, Suspense, useState, useEffect, useRef } from 'react';
+import type { ComponentType } from 'react';
+import { useShell } from "./store/ShellContext";
+import DashboardSurface from './surfaces/DashboardSurface';
+import PrayerGlobalOverlays from './components/prayer/PrayerGlobalOverlays';
+import QuickLinks from './components/navigation/QuickLinks';
+import { PageReadinessGate, useSharedPageReady } from './store/PageReadinessGate';
+import ErrorBoundary from './components/ErrorBoundary';
+import {
+  isAccessReady,
+  signInWithGoogle as startGoogleSignIn,
+  signOut as endBrowserSession,
+} from './store/supabase';
+import { ingestProductUsageEvents, isProfileServiceEnabled } from './services/backend/profileServiceApi';
+import type { Surface } from './types/domain';
+import { APP_RELEASE_LABEL, APP_RELEASE_VERSION } from './config/release';
+import { useDialog } from './hooks/useDialog';
+import { useOptionalAuthSession } from './store/AuthSessionContext';
+import { useSyncAvailability } from './store/SyncAvailabilityContext';
+import {
+  configureProductUsageAnalytics,
+  flushProductUsageEvents,
+  trackProductUsageEvent,
+} from './services/productUsageAnalytics';
+
+type SurfaceDefinition = {
+  label: string;
+  icon: string;
+  component: ComponentType;
+};
+
+const SURFACE_REGISTRY = {
+  dashboard: { label: 'Dashboard', icon: '\u{1F3E0}', component: DashboardSurface },
+  calendar: { label: 'Calendar', icon: '\u{1F4C5}', component: lazy(() => import('./surfaces/CalendarSurface')) },
+  clock: { label: 'Clock', icon: '\u23F1\uFE0F', component: lazy(() => import('./surfaces/ClockSurface')) },
+  trips: { label: 'Trips', icon: '\u{1F6EB}', component: lazy(() => import('./surfaces/TripsSurface')) },
+  projects: { label: 'Projects', icon: '\u{1F4CB}', component: lazy(() => import('./surfaces/ProjectsSurface')) },
+  software: { label: 'Software', icon: '\u{1F4BB}', component: lazy(() => import('./surfaces/SoftwareSurface')) },
+  inventory: { label: 'Inventory', icon: '\u{1F9F0}', component: lazy(() => import('./surfaces/InventorySurface')) },
+  secrets: { label: 'Secrets', icon: '\u{1F510}', component: DashboardSurface },
+  tasks: { label: 'Tasks', icon: '\u2705', component: lazy(() => import('./surfaces/TasksSurface')) },
+  employment: { label: 'Employment', icon: '\u{1F4BC}', component: lazy(() => import('./surfaces/EmploymentSurface')) },
+  finance: { label: 'Finance', icon: '\u{1F4B7}', component: lazy(() => import('./surfaces/FinanceSurface')) },
+  health: { label: 'Health', icon: '\u{1F34E}', component: lazy(() => import('./surfaces/HealthSurface')) },
+  knowledge: { label: 'Knowledge', icon: '\u{1F4DA}', component: lazy(() => import('./surfaces/KnowledgeSurface')) },
+  profile: { label: 'Profile', icon: '\u{1F3C6}', component: lazy(() => import('./surfaces/ProfileSurface')) },
+  integrations: { label: 'Integrations', icon: '\u{1F50C}', component: lazy(() => import('./surfaces/IntegrationsSurface')) },
+  activity: { label: 'Activity', icon: '\u{1F4DD}', component: lazy(() => import('./surfaces/ActivitySurface')) },
+  settings: { label: 'Settings', icon: '\u2699\uFE0F', component: lazy(() => import('./surfaces/SettingsSurface')) },
+  debug: { label: 'Debug', icon: '\u{1F41E}', component: lazy(() => import('./surfaces/DebugSurface')) },
+} satisfies Record<Surface, SurfaceDefinition>;
+
+const NAV_ITEMS: { surface: Surface; label: string; icon: string }[] = (Object.keys(SURFACE_REGISTRY) as Surface[]).filter(surface => surface !== 'secrets').map(surface => ({
+  surface,
+  label: SURFACE_REGISTRY[surface].label,
+  icon: SURFACE_REGISTRY[surface].icon,
+}));
+
+const PRIMARY_MOBILE_NAV: Surface[] = ['dashboard', 'calendar', 'tasks'];
+const MOBILE_NAV_ITEMS = NAV_ITEMS.filter(item => PRIMARY_MOBILE_NAV.includes(item.surface));
+const MOBILE_MORE_ITEMS = NAV_ITEMS.filter(item => !PRIMARY_MOBILE_NAV.includes(item.surface));
+
+function AppInner() {
+  const shell = useShell();
+  const sharedPageReady = useSharedPageReady();
+  const { readOnly } = useSyncAvailability();
+  const authSession = useOptionalAuthSession();
+  const authUser = authSession?.authUser ?? null;
+  const authUserId = authUser?.id ?? null;
+  const authLoading = authSession?.loading ?? false;
+  const signInWithGoogle = authSession?.signInWithGoogle ?? startGoogleSignIn;
+  const signOut = authSession?.signOut ?? endBrowserSession;
+  const accessReady = authSession?.accessReady ?? isAccessReady();
+  const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
+  const { dialogRef: moreDialogRef, requestClose: closeMoreDialog } = useDialog({
+    open: mobileMoreOpen, onClose: () => setMobileMoreOpen(false),
+  });
+  const previousSurface = useRef<{ surface: Surface; startedAt: number } | null>(null);
+
+  useEffect(() => {
+    configureProductUsageAnalytics({
+      enabled: Boolean(authUserId && accessReady && isProfileServiceEnabled()),
+      accountId: authUserId,
+      releaseVersion: APP_RELEASE_VERSION,
+      sink: ingestProductUsageEvents,
+    });
+    if (authUserId && accessReady) {
+      trackProductUsageEvent({
+        kind: 'performance',
+        feature: 'application',
+        action: 'ready',
+        outcome: 'success',
+        durationMs: Math.min(performance.now(), 1_800_000),
+      });
+    }
+    return () => {
+      previousSurface.current = null;
+      configureProductUsageAnalytics({
+        enabled: false,
+        accountId: null,
+        releaseVersion: APP_RELEASE_VERSION,
+        sink: ingestProductUsageEvents,
+      });
+    };
+  }, [authUserId, accessReady]);
+
+  useEffect(() => {
+    if (!authUserId || !accessReady) return;
+    const now = performance.now();
+    const previous = previousSurface.current;
+    if (previous) {
+      trackProductUsageEvent({
+        kind: 'performance',
+        feature: 'surface',
+        action: 'active_duration',
+        surface: previous.surface,
+        target: previous.surface,
+        durationMs: Math.min(now - previous.startedAt, 1_800_000),
+      });
+    }
+    trackProductUsageEvent({
+      kind: 'navigation',
+      feature: 'surface',
+      action: 'viewed',
+      surface: shell.surface,
+      target: shell.surface,
+      outcome: 'success',
+      metadata: previous ? { previousSurface: previous.surface } : undefined,
+    });
+    trackProductUsageEvent({
+      kind: 'outcome',
+      feature: 'navigation',
+      action: 'surface_opened',
+      surface: shell.surface,
+      target: shell.surface,
+      outcome: 'success',
+      durationMs: 0,
+    });
+    previousSurface.current = { surface: shell.surface, startedAt: now };
+  }, [authUserId, shell.surface, accessReady]);
+
+  const handleSignIn = async () => {
+    try {
+      await signInWithGoogle();
+    } catch (err) {
+      console.error('Sign in failed:', err);
+    }
+  };
+
+  const handleSignOut = async () => {
+    trackProductUsageEvent({
+      kind: 'action',
+      feature: 'authentication',
+      action: 'sign_out',
+      inputKind: 'pointer',
+    });
+    try {
+      await flushProductUsageEvents();
+      await signOut();
+    } catch (error) {
+      trackProductUsageEvent({
+        kind: 'error',
+        feature: 'authentication',
+        action: 'sign_out_failed',
+        outcome: 'failure',
+        errorCode: 'sign_out_failed',
+        inputKind: 'system',
+      });
+      throw error;
+    }
+  };
+
+  const renderSurface = () => {
+    const SurfaceComponent = SURFACE_REGISTRY[shell.surface].component;
+    return (
+      <ErrorBoundary name={shell.surface} key={shell.surface}>
+        <Suspense fallback={<div role="status" aria-live="polite">Loading surface...</div>}>
+          <PageReadinessGate><SurfaceComponent /></PageReadinessGate>
+        </Suspense>
+      </ErrorBoundary>
+    );
+  };
+
+  const renderAuthContent = (variant: 'sidebar' | 'mobile') => {
+    if (!accessReady) {
+      return <span className={`${variant}-auth-status`}>Account database unavailable in this build.</span>;
+    }
+
+    if (authLoading) {
+      return <span className={`${variant}-auth-status`}>Checking sign-in status...</span>;
+    }
+
+    if (authUser) {
+      return (
+        <div className={`${variant}-auth`}>
+          <div className={`${variant}-auth-user`}>
+            <span className={`${variant}-auth-avatar`}>
+              {authUser.user_metadata?.full_name?.charAt(0) || authUser.email?.charAt(0) || '?'}
+            </span>
+            <span className={`${variant}-auth-email`} title={authUser.email || ''}>{authUser.email?.split('@')[0] || 'Signed in'}</span>
+          </div>
+          <button className="btn-icon btn-sm" onClick={handleSignOut} aria-label="Sign out">Sign out</button>
+        </div>
+      );
+    }
+
+    return (
+      <button className={`${variant}-auth-login`} onClick={handleSignIn}>
+        <span style={{ fontSize: 14 }}>G</span> Sign in with Google
+      </button>
+    );
+  };
+
+  const recordNavigationAction = (surface: Surface, inputKind: 'pointer' | 'keyboard') => {
+    trackProductUsageEvent({
+      kind: 'action',
+      feature: 'navigation',
+      action: 'surface_selected',
+      surface: shell.surface,
+      target: surface,
+      outcome: 'success',
+      inputKind,
+    });
+  };
+
+  const navigateFromMobile = (surface: Surface, inputKind: 'pointer' | 'keyboard') => {
+    recordNavigationAction(surface, inputKind);
+    shell.navigate(surface);
+    setMobileMoreOpen(false);
+  };
+
+  const moreIsActive = MOBILE_MORE_ITEMS.some(item => item.surface === shell.surface);
+
+  return (
+    <div className="app-layout">
+      <nav className="sidebar" aria-label="Main navigation">
+        <div className="sidebar-logo" role="banner" aria-label="Your Life One">
+          <span className="sidebar-monogram" aria-hidden="true">S1</span>
+          <span className="sidebar-wordmark">YOUR_LIFE ONE</span>
+        </div>
+        <div className="sidebar-nav" role="navigation">
+          <QuickLinks variant="sidebar" />
+          {NAV_ITEMS.map(item => (
+            <button
+              key={item.surface}
+              className={`sidebar-item ${shell.surface === item.surface ? 'active' : ''}`}
+              onClick={event => {
+                recordNavigationAction(item.surface, event.detail === 0 ? 'keyboard' : 'pointer');
+                shell.navigate(item.surface);
+              }}
+              aria-current={shell.surface === item.surface ? 'page' : undefined}
+              aria-label={`Navigate to ${item.label}`}
+            >
+              <span className="icon" aria-hidden="true">{item.icon}</span>
+              <span className="sidebar-item-label">{item.label}</span>
+            </button>
+          ))}
+        </div>
+        <div className="sidebar-footer" role="contentinfo">
+          <div className="sidebar-release" aria-label={APP_RELEASE_LABEL}>
+            <div className="sidebar-release-copy">
+              <div className="sidebar-release-label">Current release</div>
+              <div className="sidebar-release-value">{APP_RELEASE_VERSION}</div>
+            </div>
+          </div>
+          <div className="sidebar-release-meta">
+            This sidebar always shows the exact build version you are running.
+          </div>
+          {renderAuthContent('sidebar')}
+        </div>
+      </nav>
+      <main
+        className="main-content"
+        aria-label={`${shell.surface} surface`}
+        aria-disabled={readOnly || undefined}
+        inert={readOnly || undefined}
+        tabIndex={0}
+      >
+        {renderSurface()}
+      </main>
+      {mobileMoreOpen && (
+        <div className="mobile-more-backdrop" onClick={closeMoreDialog}>
+          <div
+            ref={moreDialogRef}
+            tabIndex={-1}
+            className="mobile-more-sheet"
+            aria-label="More navigation"
+            aria-modal="true"
+            role="dialog"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="mobile-more-handle" aria-hidden="true" />
+            <div className="mobile-more-header">
+              <div>
+                <div className="mobile-more-title">More</div>
+                <div className="mobile-more-subtitle">All Your Life One surfaces</div>
+              </div>
+              <button className="btn-icon" onClick={closeMoreDialog} aria-label="Close more navigation">
+                &times;
+              </button>
+            </div>
+            <QuickLinks variant="mobile" />
+            <div className="mobile-more-grid">
+              {MOBILE_MORE_ITEMS.map(item => (
+                <button
+                  key={item.surface}
+                  className={`mobile-more-item ${shell.surface === item.surface ? 'active' : ''}`}
+                  onClick={event => navigateFromMobile(
+                    item.surface,
+                    event.detail === 0 ? 'keyboard' : 'pointer',
+                  )}
+                  aria-current={shell.surface === item.surface ? 'page' : undefined}
+                >
+                  <span className="mobile-more-icon" aria-hidden="true">{item.icon}</span>
+                  <span>{item.label}</span>
+                </button>
+              ))}
+            </div>
+            <div className="mobile-more-release" aria-label={APP_RELEASE_LABEL}>
+              <div>
+                <div className="mobile-more-release-label">Current release</div>
+                <div className="mobile-more-release-value">{APP_RELEASE_VERSION}</div>
+              </div>
+              <div className="mobile-more-release-copy">Exact build running on this device.</div>
+            </div>
+            <div className="mobile-auth-panel">
+              {renderAuthContent('mobile')}
+            </div>
+          </div>
+        </div>
+      )}
+      <nav className="mobile-bottom-nav" aria-label="Mobile navigation">
+        {MOBILE_NAV_ITEMS.map(item => (
+          <button
+            key={item.surface}
+            className={`mobile-nav-item ${shell.surface === item.surface ? 'active' : ''}`}
+            onClick={event => navigateFromMobile(
+              item.surface,
+              event.detail === 0 ? 'keyboard' : 'pointer',
+            )}
+            aria-current={shell.surface === item.surface ? 'page' : undefined}
+            aria-label={`Navigate to ${item.label}`}
+          >
+            <span className="mobile-nav-icon" aria-hidden="true">{item.icon}</span>
+            <span className="mobile-nav-label">{item.label}</span>
+          </button>
+        ))}
+        <button
+          className={`mobile-nav-item ${moreIsActive || mobileMoreOpen ? 'active' : ''}`}
+          onClick={() => setMobileMoreOpen(open => !open)}
+          aria-expanded={mobileMoreOpen}
+          aria-label="Open more navigation"
+        >
+          <span className="mobile-nav-icon" aria-hidden="true">...</span>
+          <span className="mobile-nav-label">More</span>
+        </button>
+      </nav>
+      {!readOnly && sharedPageReady && <PrayerGlobalOverlays />}
+    </div>
+  );
+}
+
+export default function App() {
+  return <AppInner />;
+}

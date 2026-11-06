@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+        "https://checkstyle.org/dtds/configuration_1_3.dtd">
+<!-- House rules enforced in CI. Keep this small: each check guards a rule from code review. -->
+<module name="Checker">
+  <module name="TreeWalker">
+    <!-- Import types at the top of the file; never write inline fully qualified class names. -->
+    <module name="RegexpSinglelineJava">
+      <property name="format"
+                value="^(?!\s*(import|package)\s).*\b(java|javax|jakarta|org|com|io|tools|lombok)\.[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*\.[A-Z]"/>
+      <property name="ignoreComments" value="true"/>
+      <property name="message" value="Import the type instead of using its fully qualified name."/>
+    </module>
+  </module>
+</module>

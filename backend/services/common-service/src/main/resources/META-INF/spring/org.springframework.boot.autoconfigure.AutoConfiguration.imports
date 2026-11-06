@@ -1,0 +1,6 @@
+com.yourlifeone.commonservice.autoconfigure.CommonServiceAutoConfiguration
+com.yourlifeone.commonservice.autoconfigure.WriteCommandAutoConfiguration
+com.yourlifeone.commonservice.autoconfigure.BusinessMetricsAutoConfiguration
+com.yourlifeone.commonservice.autoconfigure.RateLimitAutoConfiguration
+com.yourlifeone.commonservice.autoconfigure.ChangeEventAutoConfiguration
+com.yourlifeone.commonservice.autoconfigure.ObservabilityAutoConfiguration

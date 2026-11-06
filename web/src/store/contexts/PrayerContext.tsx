@@ -1,0 +1,401 @@
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useMemo,
+  useState,
+  type ReactNode,
+} from 'react';
+import type {
+  PrayerCompletionStatus,
+  PrayerTiming,
+  PrayerCompletionUndoData,
+  PrayerDeadlineBounds,
+  PrayerName,
+  PrayerOutcomeStats,
+  PrayerOutcomeStatus,
+  PrayerScheduleDay,
+  PrayerTrackingRecord,
+  PrayerTrackingState,
+} from '../../types/domain';
+import { validatePrayerTimeZone } from '../../services/prayerTimeZone';
+import { getPrayerOutcome, normalizePrayerTrackingState } from '../../services/prayerTracking';
+import type { PrayerReminderPermissionRequestResult } from '../../services/browserPrayerReminder';
+import type { getNextPrayer, PrayerTimesData } from '../../services/prayerTimes';
+import type { PrayerReminderView } from '../../services/prayerServiceReminders';
+import { isPrayerServiceEnabled } from '../../services/backend/prayerServiceApi';
+import {
+  buildPrayerSchedulePolicySnapshot,
+  reminderSchedulesHaveValidZones,
+} from '../../services/prayerSchedulePolicy';
+import {
+  buildPrayerDiagnostics,
+  describeReminderSuppression,
+  type PrayerDiagnostics,
+} from '../../services/prayerDiagnostics';
+import type { PrayerOutcomeRejection, PrayerServiceSyncState } from './usePrayerServiceSync';
+import { useGamificationContext } from './GamificationContext';
+import { useDailyMomentumContext } from './DailyMomentumContext';
+import { useSettingsContext } from './SettingsContext';
+import { useTaskContext } from './TaskContext';
+import { usePrayerTracking } from './prayer/usePrayerTracking';
+import { usePrayerSchedule } from './prayer/usePrayerSchedule';
+import { usePrayerNotificationPermission } from './prayer/usePrayerNotificationPermission';
+import { usePrayerClock } from './prayer/usePrayerClock';
+import { usePrayerOutcomeUpkeep } from './prayer/usePrayerOutcomeUpkeep';
+import { usePrayerReminderDiagnostics } from './prayer/usePrayerReminderDiagnostics';
+import { usePrayerServiceReminders } from './prayer/usePrayerServiceReminders';
+import { usePrayerMomentumReminderSync } from './prayer/usePrayerMomentumReminderSync';
+import {
+  usePrayerCompletionWorkflow,
+  type CompletePrayerOptions,
+  type PrayerCompletionMutationResult,
+} from './prayer/usePrayerCompletionWorkflow';
+import { usePrayerPersistence } from './prayer/usePrayerPersistence';
+import { usePrayerRewards } from './prayer/usePrayerRewards';
+import {
+  usePrayerCompletionPrompt,
+  type PrayerCompletionRequest,
+  type PrayerCompletionRequestOptions,
+} from './prayer/usePrayerCompletionPrompt';
+
+export type { PrayerCompletionMutationResult } from './prayer/usePrayerCompletionWorkflow';
+export type { PrayerCompletionRequest } from './prayer/usePrayerCompletionPrompt';
+export type { PrayerReminderView } from '../../services/prayerServiceReminders';
+export type { PrayerDiagnostics } from '../../services/prayerDiagnostics';
+
+export interface PrayerContextValue {
+  loaded: boolean;
+  tracking: PrayerTrackingState;
+  schedule: PrayerTimesData | null;
+  scheduleStatus: PrayerDiagnostics['scheduleStatus'];
+  scheduleError: string | null;
+  now: Date;
+  today: string;
+  localTimezone: string;
+  timezoneMatches: boolean;
+  scheduleTimezoneValid: boolean;
+  scheduleDays: PrayerScheduleDay[];
+  stats: PrayerOutcomeStats;
+  deadlines: Record<PrayerName, PrayerDeadlineBounds | null>;
+  nextPrayer: ReturnType<typeof getNextPrayer>;
+  pendingCompletion: PrayerCompletionRequest | null;
+  /** The prayer service's currently active deadline reminder. */
+  activeReminder: PrayerReminderView | null;
+  /** The prayer service's currently active opportunity or Learn/Move reminder. */
+  activeBoundedReminder: PrayerReminderView | null;
+  /** Why the last snooze was refused, in the prayer service's words. */
+  reminderSnoozeError: string | null;
+  diagnostics: PrayerDiagnostics;
+  /** Sync with the Spring Boot prayer service; `disabled` when it is not configured. */
+  serviceSync: PrayerServiceSyncState;
+  /** Why the last completion was refused or not saved; shown until dismissed. */
+  completionNotice: string | null;
+  dismissCompletionNotice: () => void;
+  requestPrayerCompletion: (
+    prayerName: PrayerName,
+    options?: PrayerCompletionRequestOptions,
+  ) => void;
+  cancelPrayerCompletion: () => void;
+  /** Records the prayer; resolves with the result and its XP once the planner has rewarded it. */
+  confirmPrayerCompletion: (status: PrayerCompletionStatus, timing?: PrayerTiming) => Promise<PrayerCompletionMutationResult> | null;
+  completePrayer: (
+    prayerName: PrayerName,
+    status: PrayerCompletionStatus,
+    options?: CompletePrayerOptions,
+  ) => PrayerCompletionMutationResult;
+  correctPrayerOutcome: (
+    prayerDate: string,
+    prayerName: PrayerName,
+    status: PrayerOutcomeStatus,
+    timing?: PrayerTiming,
+  ) => void;
+  getOutcome: (prayerDate: string, prayerName: PrayerName) => PrayerTrackingRecord | undefined;
+  undoPrayerCompletion: (inverse: PrayerCompletionUndoData) => void;
+  replacePrayerTracking: (state: PrayerTrackingState) => void;
+  snoozeActiveReminder: () => void;
+  snoozeActiveBoundedReminder: () => void;
+  retrySchedule: () => Promise<void>;
+  requestReminderPermission: () => Promise<PrayerReminderPermissionRequestResult>;
+  testReminder: (prayerName?: PrayerName) => Promise<boolean>;
+}
+
+export const PrayerCtx = createContext<PrayerContextValue | null>(null);
+
+export function usePrayerContext(): PrayerContextValue {
+  const ctx = useContext(PrayerCtx);
+  if (!ctx) throw new Error('usePrayerContext must be used within PrayerProvider');
+  return ctx;
+}
+
+/**
+ * Composes the prayer domain. Each hook under `./prayer/` owns one side effect
+ * (clock, timetable, persistence, reminders, completion); business rules stay in
+ * the pure `services/prayer*` policy modules. Hook order matters: React runs
+ * their effects in this order.
+ */
+export function PrayerProvider({ children }: { children: ReactNode }) {
+  const taskOwner = useTaskContext();
+  const gamificationOwner = useGamificationContext();
+  const momentumOwner = useDailyMomentumContext();
+  const settingsOwner = useSettingsContext();
+
+  const { settings } = settingsOwner;
+  // Prayer preferences and location come from their services: wait for them, so the app never
+  // briefly runs prayer features, or fetches a timetable, from defaults.
+  const serviceSettingsReady = settingsOwner.serviceSettingsReady;
+  const prayerEnabled = serviceSettingsReady && settings.prayerEnabled !== false;
+  const reminderEnabled = settings.prayerReminderEnabled !== false;
+  const city = settings.prayerCity || 'Bedford';
+  const country = settings.prayerCountry || 'United Kingdom';
+  const localTimezone = settingsOwner.appTimeZone.browserTimeZone;
+
+  // Tracking and timetable.
+  const store = usePrayerTracking();
+  const { tracking, loaded, getTracking, commitTracking } = store;
+  const {
+    schedule,
+    reminderSchedules,
+    status: scheduleStatus,
+    error: scheduleError,
+    retry: retrySchedule,
+    reloadForNewDay,
+  } = usePrayerSchedule({ city, country, prayerEnabled });
+  const scheduleTimezone = validatePrayerTimeZone(schedule?.timezone || '');
+  const scheduleTimezoneValid = Boolean(scheduleTimezone);
+  const timezoneMatches = Boolean(scheduleTimezone && localTimezone && scheduleTimezone === localTimezone);
+  const timetable = scheduleTimezoneValid ? schedule : null;
+  const reminderScheduleList = useMemo(() => Object.values(reminderSchedules), [reminderSchedules]);
+  const reminderSchedulesValid = reminderSchedulesHaveValidZones(reminderScheduleList);
+
+  // Clock.
+  const permission = usePrayerNotificationPermission();
+  const { refresh: refreshPermission } = permission;
+  const resume = useCallback(() => {
+    void retrySchedule();
+    void refreshPermission();
+  }, [refreshPermission, retrySchedule]);
+  const { now, today, getToday, touch } = usePrayerClock({
+    scheduleTimeZone: scheduleTimezone,
+    onDayChange: reloadForNewDay,
+    onResume: resume,
+  });
+
+  const { scheduleDays, stats, deadlines, nextPrayer } = useMemo(() => buildPrayerSchedulePolicySnapshot({
+    schedule: timetable,
+    tracking,
+    today,
+    now,
+  }), [now, timetable, today, tracking]);
+
+  // Reminders: the prayer service decides and sends them; this shows them and tells it about momentum.
+  const momentumState = momentumOwner.loaded && !momentumOwner.error ? momentumOwner.state : null;
+  const { lastNotificationKey, lastReminderError, reporter } = usePrayerReminderDiagnostics();
+  const reminders = usePrayerServiceReminders({
+    enabled: loaded && prayerEnabled,
+    prayerRemindersEnabled: reminderEnabled,
+    tracking,
+    getTracking,
+    momentum: momentumState,
+    now,
+    refreshPermission,
+    onArrived: touch,
+    reporter,
+  });
+  const { snooze: snoozeReminder, testReminder } = reminders;
+  const activeReminder = reminders.deadline;
+  const activeBoundedReminder = reminders.notice;
+  const snoozeActiveReminder = useCallback(() => {
+    if (activeReminder?.canSnooze) void snoozeReminder(activeReminder.key);
+  }, [activeReminder, snoozeReminder]);
+  const snoozeActiveBoundedReminder = useCallback(() => {
+    if (activeBoundedReminder?.canSnooze) void snoozeReminder(activeBoundedReminder.key);
+  }, [activeBoundedReminder, snoozeReminder]);
+  usePrayerMomentumReminderSync({
+    momentum: loaded && prayerEnabled ? momentumState : null,
+    saved: reminders.momentumPreferences,
+    reporter,
+  });
+
+  // Completion: prayer tracking and today's habit here; the planner rewards the recorded prayer.
+  const {
+    completePrayer,
+    correctPrayerOutcome,
+    undoPrayerCompletion,
+    revertRefusedOutcome,
+  } = usePrayerCompletionWorkflow({
+    taskOwner,
+    timetable,
+    scheduleTimeZone: scheduleTimezone,
+    today,
+    getToday,
+    getTracking,
+    commitTracking,
+  });
+  const { awaitReward, onOutcomeConfirmed, onOutcomeRefused } = usePrayerRewards(taskOwner, gamificationOwner);
+
+  const [completionNotice, setCompletionNotice] = useState<string | null>(null);
+  const dismissCompletionNotice = useCallback(() => setCompletionNotice(null), []);
+  // The service refused an outcome outright: show the service's truth instead and say why.
+  const rejectOutcome = useCallback((rejection: PrayerOutcomeRejection) => {
+    revertRefusedOutcome(rejection);
+    onOutcomeRefused(rejection.key);
+    setCompletionNotice(`${rejection.record.prayerName} on ${rejection.record.date} was not saved: ${rejection.message}`);
+  }, [onOutcomeRefused, revertRefusedOutcome]);
+
+  // Persistence: the prayer service for outcomes. Each outcome change the service confirms brings its
+  // planner reward up to date.
+  const { serviceSync, reload: reloadOutcomes, allowBulkDelete } = usePrayerPersistence({
+    store,
+    sourcesLoaded: taskOwner.loaded && settingsOwner.loaded,
+    locationReady: serviceSettingsReady,
+    location: { city, country },
+    onRejected: rejectOutcome,
+    onConfirmed: onOutcomeConfirmed,
+  });
+  usePrayerOutcomeUpkeep({
+    loaded,
+    tracking,
+    reminderSchedules,
+    reminderSchedulesValid,
+    today,
+    now,
+    reload: reloadOutcomes,
+  });
+
+  const {
+    pendingCompletion,
+    requestPrayerCompletion,
+    cancelPrayerCompletion,
+    confirmPrayerCompletion,
+  } = usePrayerCompletionPrompt({ today, timetable, completePrayer, awaitReward, showNotice: setCompletionNotice });
+
+  const getOutcome = useCallback(
+    (prayerDate: string, prayerName: PrayerName) => getPrayerOutcome(tracking, prayerDate, prayerName),
+    [tracking],
+  );
+
+  const replacePrayerTracking = useCallback((state: PrayerTrackingState) => {
+    // Replacing the tracking (Settings → Reset all progress) is the one bulk deletion allowed.
+    allowBulkDelete();
+    commitTracking(normalizePrayerTrackingState(state, { now: new Date() }));
+  }, [allowBulkDelete, commitTracking]);
+
+  const suppressionReason = describeReminderSuppression({
+    prayerEnabled,
+    reminderEnabled,
+    serviceEnabled: isPrayerServiceEnabled(),
+    reminderLoadError: reminders.loadError,
+  });
+  const activeReminders = reminders.showing;
+  const permissionState = permission.state;
+  const diagnostics = useMemo(() => buildPrayerDiagnostics({
+    scheduleStatus,
+    schedule,
+    scheduleError,
+    city,
+    country,
+    scheduleTimezone,
+    scheduleTimezoneValid,
+    localTimezone,
+    timezoneMatches,
+    activeReminders,
+    suppressionReason,
+    permissionState,
+    lastNotificationKey,
+    lastReminderError,
+  }), [
+    activeReminders,
+    city,
+    country,
+    lastNotificationKey,
+    lastReminderError,
+    localTimezone,
+    permissionState,
+    schedule,
+    scheduleError,
+    scheduleStatus,
+    scheduleTimezone,
+    scheduleTimezoneValid,
+    suppressionReason,
+    timezoneMatches,
+  ]);
+
+  const requestReminderPermission = permission.request;
+
+  const value = useMemo<PrayerContextValue>(() => ({
+    loaded,
+    tracking,
+    schedule,
+    scheduleStatus,
+    scheduleError,
+    now,
+    today,
+    localTimezone,
+    timezoneMatches,
+    scheduleTimezoneValid,
+    scheduleDays,
+    stats,
+    deadlines,
+    nextPrayer,
+    pendingCompletion,
+    activeReminder,
+    activeBoundedReminder,
+    reminderSnoozeError: reminders.snoozeError,
+    diagnostics,
+    serviceSync,
+    completionNotice,
+    dismissCompletionNotice,
+    requestPrayerCompletion,
+    cancelPrayerCompletion,
+    confirmPrayerCompletion,
+    completePrayer,
+    correctPrayerOutcome,
+    getOutcome,
+    undoPrayerCompletion,
+    replacePrayerTracking,
+    snoozeActiveReminder,
+    snoozeActiveBoundedReminder,
+    retrySchedule,
+    requestReminderPermission,
+    testReminder,
+  }), [
+    activeReminder,
+    activeBoundedReminder,
+    cancelPrayerCompletion,
+    completePrayer,
+    completionNotice,
+    confirmPrayerCompletion,
+    correctPrayerOutcome,
+    deadlines,
+    diagnostics,
+    dismissCompletionNotice,
+    getOutcome,
+    loaded,
+    localTimezone,
+    nextPrayer,
+    now,
+    pendingCompletion,
+    reminders.snoozeError,
+    replacePrayerTracking,
+    requestPrayerCompletion,
+    requestReminderPermission,
+    retrySchedule,
+    schedule,
+    scheduleDays,
+    scheduleError,
+    scheduleStatus,
+    scheduleTimezoneValid,
+    serviceSync,
+    snoozeActiveBoundedReminder,
+    snoozeActiveReminder,
+    stats,
+    testReminder,
+    timezoneMatches,
+    today,
+    tracking,
+    undoPrayerCompletion,
+  ]);
+
+  return <PrayerCtx.Provider value={value}>{children}</PrayerCtx.Provider>;
+}

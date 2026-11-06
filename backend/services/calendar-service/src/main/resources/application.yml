@@ -1,0 +1,150 @@
+server:
+  port: ${PORT:8080}
+
+spring:
+  application:
+    name: calendar-service
+  datasource:
+    # SPRING_DATASOURCE_URL, _USERNAME and _PASSWORD are required at runtime.
+    hikari:
+      # Sync reads Google without holding a connection, then writes in short transactions.
+      maximum-pool-size: 3
+      minimum-idle: ${APP_DATASOURCE_MINIMUM_IDLE:1}
+      # Opening a TLS connection through the Supabase pooler can take a few seconds.
+      connection-timeout: ${APP_DATASOURCE_CONNECTION_TIMEOUT_MS:8000}
+      # Keep one connection warm and validate it with keepalive. Avoid reopening TLS connections
+      # every five minutes; the bounded pool still replaces stale or broken connections.
+      keepalive-time: 60000
+      idle-timeout: 120000
+      max-lifetime: ${APP_DATASOURCE_MAX_LIFETIME_MS:1800000}
+      validation-timeout: 250
+      # Start even when the database is unreachable; health reports DOWN until it returns.
+      initialization-fail-timeout: -1
+      data-source-properties:
+        sslmode: ${APP_DATASOURCE_SSLMODE:require}
+  rabbitmq:
+    template:
+      observation-enabled: true
+    listener:
+      simple:
+        observation-enabled: true
+    # SPRING_RABBITMQ_HOST, _USERNAME and _PASSWORD are set by the deploy.
+    connection-timeout: 2s
+  jpa:
+    open-in-view: false
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    properties:
+      # Do not contact the database while starting.
+      hibernate.boot.allow_jdbc_metadata_access: false
+      # A sync writes hundreds of events; send them in batches.
+      hibernate.jdbc.batch_size: 100
+      hibernate.order_inserts: true
+      hibernate.order_updates: true
+
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+    export:
+      enabled: ${GRAFANA_TRACING_ENABLED:false}
+  opentelemetry:
+    tracing:
+      export:
+        max-queue-size: 512
+        max-batch-size: 128
+        timeout: 3s
+        schedule-delay: 5s
+        otlp:
+          endpoint: ${GRAFANA_OTLP_TRACES_URL:http://127.0.0.1:4318/v1/traces}
+          connect-timeout: 1s
+          timeout: 3s
+      limits:
+        max-attributes: 32
+        max-attribute-value-length: 128
+        max-events: 4
+        max-links: 4
+        max-attributes-per-event: 4
+        max-attributes-per-link: 4
+    resource-attributes:
+      "service.instance.id": ${APP_SERVICE_INSTANCE_ID:local}
+      "deployment.environment.name": ${APP_ENVIRONMENT:production}
+  endpoints:
+    access:
+      # No actuator endpoint is served over HTTP; metrics are pushed to Grafana Cloud.
+      default: none
+  metrics:
+    tags:
+      service: calendar-service
+      instance: ${APP_SERVICE_INSTANCE_ID:local}
+    distribution:
+      slo:
+        "[http.server.requests]": 100ms,300ms,1s,3s,10s
+        "[http.client.requests]": 100ms,300ms,1s,3s,10s
+      percentiles:
+        "[http.server.requests]": 0.5, 0.95, 0.99
+    data:
+      repository:
+        autotime:
+          # How long each database repository call takes.
+          percentiles: 0.5, 0.95, 0.99
+  otlp:
+    metrics:
+      export:
+        # Pushed to Grafana Cloud's OTLP gateway once a minute; off unless the deploy provides a token.
+        enabled: ${GRAFANA_METRICS_ENABLED:false}
+        url: ${GRAFANA_OTLP_METRICS_URL:http://localhost:4318/v1/metrics}
+        headers:
+          Authorization: ${GRAFANA_OTLP_AUTHORIZATION:}
+        step: 1m
+        connect-timeout: 1s
+        read-timeout: 3s
+
+app:
+  write-commands:
+    queue: yourlife.calendar.commands
+    processed-table: calendar.processed_command
+    # The React app gives up after 15 seconds on calendar writes; answer before it does.
+    reply-timeout: 12s
+    consumers: 1
+    # Processed writes are remembered this long (a retry within it is applied once), then deleted.
+    retention: 30d
+  cors:
+    allowed-origins: ${APP_CORS_ALLOWED_ORIGINS:http://localhost:5173,https://your-life-one.example}
+  auth:
+    # Public Supabase project URL; access tokens are verified against its JWKS.
+    supabase-url: ${SUPABASE_URL:https://example-project.supabase.co}
+  calendar:
+    # Sync mirrors Google events that overlap this window around now.
+    sync-past-days: 60
+    sync-future-days: 365
+    # Longest date range one events request may ask for.
+    max-range-days: 800
+    default-source-name: Calendar
+    default-source-color: "#4f5bff"
+    google-api-base-url: ${GOOGLE_CALENDAR_API_BASE_URL:https://www.googleapis.com/calendar/v3}
+    # This service holds the Google OAuth client and each user's refresh tokens. Access tokens are
+    # refreshed on demand and kept only in memory.
+    google-oauth:
+      client-id: ${GOOGLE_OAUTH_CLIENT_ID:}
+      client-secret: ${GOOGLE_OAUTH_CLIENT_SECRET:}
+      token-url: ${GOOGLE_OAUTH_TOKEN_URL:https://oauth2.googleapis.com/token}
+      revoke-url: ${GOOGLE_OAUTH_REVOKE_URL:https://oauth2.googleapis.com/revoke}
+    google-credential:
+      # Base64 of a 32-byte AES-256 key encrypting stored refresh tokens. The deploy generates it once on
+      # the server; it never leaves it. Losing it means every user reconnects their Google accounts.
+      key: ${CALENDAR_GOOGLE_CREDENTIAL_KEY:}
+      key-version: 1
+
+logging:
+  structured:
+    format:
+      console: ecs
+
+jdbc:
+  includes: QUERY
+  datasource-proxy:
+    include-parameter-values: false
+    query:
+      enable-logging: false
+    slow-query:
+      enable-logging: false

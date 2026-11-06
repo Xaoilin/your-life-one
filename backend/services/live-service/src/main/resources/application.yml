@@ -1,0 +1,88 @@
+server:
+  port: ${PORT:8080}
+
+spring:
+  application:
+    name: live-service
+  rabbitmq:
+    template:
+      observation-enabled: true
+    listener:
+      simple:
+        observation-enabled: true
+    # SPRING_RABBITMQ_HOST, _USERNAME and _PASSWORD are set by the deploy.
+    connection-timeout: 2s
+
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+    export:
+      enabled: ${GRAFANA_TRACING_ENABLED:false}
+  opentelemetry:
+    tracing:
+      export:
+        max-queue-size: 512
+        max-batch-size: 128
+        timeout: 3s
+        schedule-delay: 5s
+        otlp:
+          endpoint: ${GRAFANA_OTLP_TRACES_URL:http://127.0.0.1:4318/v1/traces}
+          connect-timeout: 1s
+          timeout: 3s
+      limits:
+        max-attributes: 32
+        max-attribute-value-length: 128
+        max-events: 4
+        max-links: 4
+        max-attributes-per-event: 4
+        max-attributes-per-link: 4
+    resource-attributes:
+      "service.instance.id": ${APP_SERVICE_INSTANCE_ID:local}
+      "deployment.environment.name": ${APP_ENVIRONMENT:production}
+  endpoints:
+    access:
+      # No actuator endpoint is served over HTTP; metrics are pushed to Grafana Cloud.
+      default: none
+  metrics:
+    tags:
+      service: live-service
+      # Both OVH hosts run this service; counters must never share an instance identity.
+      instance: ${APP_SERVICE_INSTANCE_ID:local}
+    distribution:
+      slo:
+        "[http.server.requests]": 1s,10s,1m,10m,1h
+  otlp:
+    metrics:
+      export:
+        # Pushed to Grafana Cloud's OTLP gateway once a minute; off unless the deploy provides a token.
+        enabled: ${GRAFANA_METRICS_ENABLED:false}
+        url: ${GRAFANA_OTLP_METRICS_URL:http://localhost:4318/v1/metrics}
+        headers:
+          Authorization: ${GRAFANA_OTLP_AUTHORIZATION:}
+        step: 1m
+        connect-timeout: 1s
+        read-timeout: 3s
+
+app:
+  cors:
+    allowed-origins: ${APP_CORS_ALLOWED_ORIGINS:http://localhost:5173,https://your-life-one.example}
+  auth:
+    # Public Supabase project URL; access tokens are verified against its JWKS.
+    supabase-url: ${SUPABASE_URL:https://example-project.supabase.co}
+  rate-limit:
+    # Per signed-in user: a tab reconnects once per stream, so this is generous.
+    requests-per-minute: ${APP_RATE_LIMIT_PER_MINUTE:60}
+    burst: ${APP_RATE_LIMIT_BURST:20}
+  live:
+    # A comment line this often keeps proxies from closing a quiet stream.
+    heartbeat: PT25S
+    # A stream ends when its access token expires, and never lasts longer than this; the tab reconnects.
+    max-stream-duration: PT1H
+    # Open streams one user may hold at once (tabs and devices); a new one past this closes the oldest.
+    max-streams-per-user: 12
+
+logging:
+  structured:
+    format:
+      console: ecs

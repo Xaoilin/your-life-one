@@ -1,0 +1,179 @@
+# Engineering Guide
+
+## Hosted Web Delivery
+
+Your Life One is delivered as a GitHub Pages website backed by Supabase. The browser page is the product boundary; GitHub Actions is the authoritative validation and deployment boundary.
+
+The normal change flow is:
+
+1. Work on a dedicated topic branch (for example `codex/<short-description>` or `claude/<short-description>`).
+2. Keep the change within its stated ownership and preserve unrelated work.
+3. Add or update the smallest relevant regression coverage and documentation.
+4. Let the protected pull-request checks validate the exact branch contents.
+5. Have Sol integrate the accepted commit, publish the website and required Supabase functions, and verify the deployed result.
+
+A branch-only change is not deployed or live. The deployed DigitalOcean bundle, its `public/release.json` manifest and deployment receipt must describe the same product version and candidate. The legacy Pages address only redirects.
+
+## Root Cause Analysis
+
+Reproduce a defect from the user-visible failure, then trace its causes to the deepest validated layer before choosing a fix. Record contributing causes when they matter to future maintenance. Add a regression check for every logic defect.
+
+## Definition Of Done
+
+A feature or documentation change is ready for integration when:
+
+- the scoped behavior or documentation is complete;
+- the relevant GitHub Actions checks are green;
+- visible browser behavior has been reviewed at the affected responsive widths;
+- hosted integration changes have actionable diagnostics and truthful degraded states;
+- account, security, and user-facing copy remain aligned;
+- `docs/feature-status.md` is updated when product status changes.
+
+Only Sol can claim the overall change live after protected promotion, DigitalOcean deployment and direct live verification.
+
+When a release also deploys the backend, wait for its production workflow and native readiness checks to finish before frontend publication. The frontend gate correctly rejects a transient 502 during a backend restart; after backend health is verified, rerun the failed publication against the same tested source rather than weakening that gate.
+
+## Validation Contract
+
+The required hosted-web checks are policy, database contract, lint, typecheck, unit, browser E2E, and web build. The risk-to-check map, focused-versus-complete gate claims, determinism rules, and known gaps are maintained in [`testing-strategy.md`](testing-strategy.md). Browser E2E covers assembled behavior; the visual path supplies screenshot evidence for surfaces where rendered review matters. The exact commands and workflow details belong to the repository automation and CI logs, not to a second product runtime.
+
+## Deployment Versioning
+
+- Your Life One versions use semver across `package.json`, `package-lock.json`, and `public/release.json`.
+- The web shell exposes the build version and checks the deployed manifest after load and when a hidden page becomes visible.
+- A newer deployed semver causes one browser reload when the page is visible, mounted, and has no queued writes, open modal, or visible editable text. Unsafe checks defer without consuming the one-reload marker; the next regular or foreground check can retry. Manifest requests have a five-second abort deadline.
+- Deployment evidence identifies the source revision, web artifact, Supabase function state, Pages URL, and observed version.
+
+## CI And Branch Protection
+
+- `master` is protected by pull requests and the required policy, database, lint, typecheck, unit, browser E2E, web-build, and review checks.
+- Pull-request runs are tied to the exact branch tree. Draft and concurrency controls prevent stale evidence from being treated as current.
+- Same-repository pull requests (any branch name; drafts are held) can be promoted only after their required checks pass and the promoted tree is verified against the tested tree.
+- GitHub Pages deployment runs only for the protected `master` path. Supabase Edge Function deployment follows the same candidate identity where a function changed.
+- API-funded automated review is off by default. Codex source review is completed before promotion; the stable `codex-review` check reports the API deferral truthfully. Explicit opt-in automated review remains advisory when unavailable; completed high-severity findings remain blocking.
+- Post-promotion verification fails closed for a source, tree, artifact, deployment, or live-version mismatch.
+
+### Verified candidate route
+
+The stable required contexts are `agent-policy`, `database`, `lint`, `typecheck`, `unit`, `e2e`, `build`, and `codex-review`. Add a missing context through the field-scoped branch-protection endpoint, preserving the other contexts, their app bindings, strictness, and all unrelated protection settings; read back the result.
+
+Auto-promotion records the PR merge-tree and source attempt in `ci-tested-tree`, rechecks the latest matching CI attempt and current base before the protected squash merge, and verifies that the resulting master tree is identical. The master receipt reuses that source evidence and dispatches the existing `deploy_sha` and `source_run_id` inputs.
+
+Both deployment workflows run `verify-ci-receipt.mjs deployment` from protected master before deployment work. Manual dispatch requires both inputs and a successful latest PR CI run. Automatic `workflow_run` delivery checks the completed master CI run and resolves its merged PR's latest source receipt. Both routes download the original `ci-tested-tree` artifact and reuse `evaluateCiReceipt` to bind repository, PR, source run/attempt, commit, tree, required jobs, and current `origin/master`. Missing or expired evidence, skipped gates, stale attempts, non-master workflow refs, and mismatches fail closed before remote mutation. Pages rechecks the receipt immediately before publishing its built artifact.
+
+`handoff:check` accepts only the latest matching CI and deployment attempts; an older success cannot mask a newer failure or incomplete run. Recovery supplies fresh successful evidence for the same current candidate through the protected route, without bypassing a failed gate. Acceptance records the exact source/tree, deployment artifact, and live bundle version.
+
+## Testing Expectations
+
+### Composition boundaries
+
+Rendered components consume owning domain hooks directly. Shell owns navigation and readiness only; a true cross-domain operation must be named for its workflow and expose a consumer-shaped contract. Do not add an application service bag, generic service locator, dependency-injection container, or all-domain context. `npm run agent:policy` enforces the lightweight composition rule, and `src/test/composition.boundaries.test.ts` proves that a representative broad bag is rejected.
+
+### Unit and contract checks
+
+Business rules, service calls, semantic mutations, and provider error mapping should have focused deterministic coverage. Service checks should exercise success and failure responses without hiding diagnostics.
+
+Keep business rules in plain modules that take their inputs (including the current time and time zone) as arguments, so they are tested without rendering. Every context module exports its Context object; render tests supply typed fake values with `provide` and `renderWithContexts` from `src/test/renderWithContexts.tsx` instead of `vi.mock`-ing context hook modules. Reserve `vi.mock` for true infrastructure boundaries such as the Supabase client, network, and browser APIs.
+
+Account data belongs to the Spring services, whose contracts (`contracts/*`) both sides test against. The database contract (`npm run test:database`) remains the authority for what Supabase still owns: Vault secret RLS and idempotency, agent OAuth approvals, and the retired record store staying retired.
+
+### Browser E2E
+
+User-facing flows should have Playwright coverage when they change visible behavior. Existing specs should be extended instead of duplicated. Responsive shell or surface work covers the repository's supported mobile, tablet, and wider browser widths, with no horizontal overflow and no clipped content at increased text zoom.
+
+### Browser review
+
+Direct browser review is required for visible user flows and especially for OAuth, browser notification permission, page-open prayer reminders, and live integrations. Review loading, empty, success, disabled, and error states relevant to the change. Screenshot evidence is useful for layout claims but is not a substitute for behavior or hosted verification.
+
+## Error Handling And Resilience
+
+- Do not swallow errors. Surface a user-actionable message and preserve structured diagnostics.
+- Remote integrations should use the established retry, circuit-breaker, timeout, and logging utilities where appropriate.
+- Every call to a Your Life One service goes through `callService` (`src/services/backend/serviceClient.ts`), which owns backoff so no feature adds its own: transient failures (network, timeout, 429, 502, 503, 504) retry with exponential backoff and full jitter (`src/services/backoff.ts`), honouring `Retry-After`, within `SERVICE_RETRY` limits. Reads always retry; writes only with an Idempotency-Key. Five consecutive failed attempts open that endpoint's circuit (`/api/<service>/v1/<resource>`): calls fail fast with `service_unavailable` for 30 seconds, then one is let through to test it.
+- A failed service load keeps the last confirmed data and retries a few times on a timer, then whenever the page is shown again (`useServiceLoad`); a dropped live-update stream reconnects with backoff and asks every domain to reload once it is back. Never treat a dropped stream as invalid authentication.
+- The locked Supabase Auth 2.111.0 SDK owns session renewal: concurrent refresh calls share one promise, transient retries back off within a 30-second attempt-start budget, and failures impose a 60-second same-token cooldown. No application token-refresh loop is added. Auth revision checks reject bootstrap completion superseded by sign-out or account changes. Write retries reuse the same Idempotency-Key; read recovery never replays writes.
+- Session rules (signing out is only ever the user's choice or the auth server ending the session):
+  - Calls to Your Life One services take their token from `getFreshAccessToken`, which renews a token within a minute of expiry. A `401` renews the session once and retries with the same `Idempotency-Key`; a second `401` is reported, never turned into a sign-out.
+  - A refused Supabase call (secrets or OAuth approvals) is shown on its page; it never signs the user out. Only a session the auth server has ended clears account data.
+  - At startup, a stored session whose renewal fails for a network reason is retried and then shown as "Reconnecting to Your Life One" with Retry, never as the sign-in screen. The SDK's null `INITIAL_SESSION` for that case is ignored.
+  - Google Calendar access never touches the Your Life One session: consent uses Google's popup code flow, credentials stay server-side, and Google problems are `409 google_reconnect_required`, not `401`.
+- Transient read failures preserve confirmed same-account data and drafts with visible freshness; ended sessions and account changes fail closed. Domain operation errors do not invalidate unrelated capabilities.
+- The browser's `navigator.onLine` flag is a network hint. An authenticated service HTTP response overrides a false offline hint, restoring controls without waiting for an `online` event; the next browser network change discards that evidence. Operation errors remain on their owning page, writes still require server confirmation, and no extra connectivity polling is added.
+- Degraded states must say what is unavailable and what the user can do in the page. Reminder delivery uses system Web Notifications only; unavailable notifications do not create sticky in-app reminders.
+- Diagnostics redact tokens and secrets while retaining request IDs and normalized failure codes where available.
+
+## Data And Security Invariants
+
+- Every new or changed SQL query must follow [SQL query review](sql-query-review.md): inspect existing indexes and representative plans, and add a missing index only when measured benefit justifies its write and storage cost.
+- Keep domain types in `src/types/domain.ts` and the account -> source -> event Calendar hierarchy.
+- Account data is signed-in and account-owned, held by the Spring services; nothing reads or writes it through generic Supabase records. Online server confirmation is required for writes; transient network failures may retain only the current account's confirmed in-memory data.
+- Passive Google Calendar sync stays non-interactive; explicit reconnect or consent is user initiated.
+- Hosted Calendar refresh credentials and Vault secret values never enter browser storage, shared payloads, logs, or exports.
+- Project catalogue records may include names, links, documentation, and display-only guidance. They must not include private credentials or machine-specific execution state.
+- Use the established local-date-safe helpers for day-based behavior; never derive local dates by slicing UTC ISO strings.
+
+## Integration setup
+
+Integrations always offers Google Calendar and the read-only GitHub App, including
+for empty or partial account collections. Configure Google to connect the signed-in
+profile's Google account or another one through Google's consent popup; reconnect
+remains explicit for each account. None of these replace the Your Life One session.
+GitHub uses **Install and authorize GitHub App**, followed by repository selection
+and evidence sync. Revoked GitHub access requires **Reconnect GitHub App**.
+Provider failures remain visible and leave setup available for an explicit retry.
+Slack and Linear are unavailable; there are no simulated connection actions.
+
+Google Calendar authorization requests only `calendar.calendarlist.readonly` and
+`calendar.events`, with `include_granted_scopes: false`. The provider adapter uses
+calendar-list reads and event reads/creation/updates/deletion; it does not change
+calendar properties, calendars, sharing ACLs or settings. These two scopes cover
+that operation set under [Google's scope reference](https://developers.google.com/workspace/calendar/api/auth).
+Existing credentials are not revoked by a website release; the narrower request
+applies on explicit connect/reconnect. Public product/privacy pages are served
+without sign-in at `/yourlifeone/about.html` and `/yourlifeone/privacy.html`; their publication
+does not establish Google verification approval.
+
+Google deployment configuration belongs to the site operator, not an end-user
+Settings field. The Pages build uses `VITE_GOOGLE_OAUTH_CLIENT_ID`; the calendar
+service holds the matching client and the server-only client secret (the
+`your-life-one-services` production environment) and each user's refresh token,
+encrypted. Use the existing protected deployment
+workflow and authorized website configuration. Missing build configuration
+disables adding another Google account and explains who can restore setup.
+
+Settings hydration appends only missing supported providers by provider identity
+on initial load and remote refresh. It keeps all stored IDs, status, timestamps,
+choices, duplicate historical provider rows and unknown providers in the saved
+collection. The display projection uses current support copy and one card per
+supported provider; it is never autosaved. Supported actions update the selected
+stored record ID. Calendar account -> source -> event identity remains separate.
+This repair adds no provider operation, schema, scope or external agent API;
+the existing external-access gaps in `agent-access.md` remain unchanged.
+
+## UI And UX Rules
+
+- Preserve the established dark theme and component language unless a redesign is in scope.
+- Empty, loading, and unavailable states explain the next useful action.
+- Destructive actions require clear confirmation.
+- Preserve labels, roles, keyboard access, focus behavior, responsive layout, and `prefers-reduced-motion` behavior.
+- Pair state colours with visible text. Browser-native behavior is an enhancement, not the sole route to an important outcome.
+
+The More sheet and Secret, Task and Trip wizard editors share `useDialog` for
+initial focus, containment, Escape and return focus. The Project reference
+drawer and the Project and Milestone editors use it too; when the opener has
+left the page, `restoreFocusFallback` finds the project's card again. Draft editors compare the
+current fields with their opening values; dismissal asks for explicit discard
+only when changed, and pending saves cannot dismiss. Successful save closes
+directly. Avoid adding React `autoFocus` to these controls: it runs before the
+hook captures the opener and prevents reliable return focus.
+
+Calendar and Knowledge card open actions
+use native buttons beside other controls; Health removal requires confirmation.
+
+## Documentation Rules
+
+- Keep `AGENTS.md` short and operational; put long-form architecture and process material under `docs/`.
+- Update the relevant document in the same change when behavior or delivery boundaries change.
+- `README.md`, `AGENTS.md`, `docs/project-architecture.md`, `docs/engineering-guide.md`, and `docs/feature-status.md` are active source-of-truth docs.
+- `docs/agentic-coding-workflow.md` records the current hosted web automation policy.
+- Status language distinguishes real behavior, degraded browser capability, and placeholder or simulated integrations.

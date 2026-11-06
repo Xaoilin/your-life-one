@@ -1,0 +1,162 @@
+# AI Agent Access
+
+## Decision
+
+Your Life One uses MCP as the external AI-agent interface. MCP fits the hosted browser product because it provides discoverable semantic tools, typed inputs, OAuth-backed account identity, and explicit per-domain approval without creating a second product runtime.
+
+A repository CLI may validate code, fixtures, or exported test data, but it is not an account-data interface. Agents must not bypass MCP with Supabase credentials, direct table or service access, browser automation, shared-file edits, or copied session tokens. (The generic record RPCs were retired in v0.2.206.)
+
+Your Life One has no in-app conversational assistant (Partner was removed on 2026-09-26). External agents require a published MCP capability.
+
+## Agent Contract
+
+When an AI agent accesses Your Life One, it must:
+
+1. discover and use the published Your Life One MCP server for the target domain;
+2. use semantic tools such as list, inspect, add, update, record activity, or remove rather than generic record patches;
+3. derive account identity from the OAuth token and remain inside the domain's approval boundary;
+4. request explicit user confirmation for destructive, bulk, ambiguous, or materially consequential writes;
+5. claim success only from a confirmed tool receipt and re-read when the postcondition matters;
+6. stop and report an unavailable capability when no published domain tool exists.
+
+There is no direct-database or UI-automation fallback.
+
+## Feature Contract
+
+Every new or materially changed account-data feature must define one narrow agent surface alongside its UI:
+
+- read tools for list/search and one-record inspection;
+- create and update tools for the feature's real business operations;
+- a separately confirmed remove/archive tool when the feature permits it;
+- stable identifiers, bounded inputs, actionable errors, and idempotency keys for retryable writes;
+- account isolation, per-client approval, least-privilege RPCs, and redacted diagnostics;
+- focused contract tests, denial tests, and documentation of unsupported actions.
+
+A first-party UI path may share the same domain service, but it does not replace the external MCP contract. A feature without the required interface is an explicit acceptance gap, never permission to use a lower-level data path.
+
+## Current Capability Matrix
+
+| Domain | In-app use | External agent access | Current rule |
+| --- | --- | --- | --- |
+| Inventory | Inventory surface | Published `your-life-one-inventory-mcp` | Use its seven narrow tools and Inventory-specific OAuth approval. The function forwards the agent's token to the life admin service (`/api/life/v1/inventory`), which holds the records and re-checks the approval (the function first asks it whether the agent is approved: a refusal is the OAuth 403 challenge); `inventory_resolve_project` resolves projects in the knowledge service (`/api/knowledge/v1/projects/resolve`), which re-checks the same approval. |
+| Employment | Employment surface | `your-life-one-employment-mcp` | Use its six narrow application/history tools with a separate Employment OAuth approval. Inventory approval does not grant Employment access. The function checks approval through `/api/life/v1/jobs/access` without reading applications, then forwards the agent's token to the life admin service (`/api/life/v1/jobs`), which holds the records and re-checks the approval. |
+| Finance equity | `Navigation and editor` | `your-life-one-equity-mcp` (requires deployment and Equity OAuth approval) | Five semantic position tools; isolated from cash/banking and other MCP domains. The function forwards the agent's token to the finance service (`/api/finance/v1/equity/positions`), which holds the positions and re-checks the Equity approval. See `finance-equity.md`. |
+| Finance banking review and loans | Dated review, loan records and saved calculator profiles | `your-life-one-finance-mcp` (requires deployment and Finance OAuth approval) | Two semantic review tools and four profile tools; independent of Equity and existing manual accounts. The function forwards the agent's token to the finance service (`/api/finance/v1/review`), which holds the review and profiles and re-checks the Finance approval. See `finance-banking-review.md`. |
+| Finance manual accounts, transactions, budgets, savings goals | Finance surface | Not yet published | The finance service refuses agent tokens on these paths (403 `agent_not_approved`); external agents stop at the missing MCP boundary. |
+| Tasks, Calendar, Knowledge, Prayer | Their surfaces | Not yet published | External agents stop at the missing MCP boundary. |
+| Other Your Life One features | Surface-dependent | Not yet published | Treat external access as unavailable until a domain MCP contract is delivered and listed here. |
+| Secrets | Intentionally unavailable | Intentionally unavailable | Secret plaintext remains outside agent tools. |
+
+The LenderA/LenderB calculator saves explicit named profiles within the existing
+Finance review, under the same Finance approval. Agents use
+`finance_list_loan_profiles` / `finance_get_loan_profile` to read profiles and the
+current review revision, `finance_save_loan_profile` to create or update one (setting
+it default deliberately clears other default flags), and
+`finance_remove_loan_profile` with explicit confirmation to remove one. Writes
+carry the exact expected review revision and stable request ID; they forward a
+fixed semantic command to the Finance service's existing review endpoint. Legacy
+whole-review writes that omit or send null `loanProfiles` preserve them; explicit
+`[]` clears them. Profiles are assumptions, never bank actions, and calculated
+schedules and ratios are not stored. `finance_get_review` and
+`finance_save_review` remain the source-loan interface. No new OAuth scope is added.
+
+Finance expense-group choices are included in the existing semantic review tools
+as optional `expenseGroups: [{ label, group }]`, where group is `non-discretionary`,
+`necessary`, or `discretionary`. A choice applies to that normalized category label
+across imported months. Read the current review, preserve its other fields, and
+save with its exact `updatedAt` and a new request ID. Older imports that omit the
+field preserve existing choices; an explicit empty array clears them. The browser
+uses the same revision-checked service save. No new account scope or bank action
+is introduced. Shared contracts and authenticated synthetic acceptance cover
+round-trip persistence; production acceptance requires the matching service release.
+
+## Combined prayer completion
+
+Asr completion from Dhuhr and Isha completion from Maghrib use the existing
+first-party prayer outcome operation and keep separate outcomes. Their API
+request and response shapes are unchanged. Prayer has no published semantic MCP
+tools, so external-agent acceptance remains blocked until that capability is
+delivered. Automated verification uses synthetic service/browser fixtures;
+agents cannot record or inspect a real account's prayers through a lower-level
+API, database or browser workaround.
+
+## Employment MCP Requirement
+
+The `your-life-one-employment-mcp` function exposes semantic tools for:
+
+- `employment_list_applications` with bounded pipeline, work-type, remote-proof, and text filters;
+- `employment_get_application` by stable ID;
+- `employment_add_application` and `employment_update_application` with the fully-remote and UK/EMEA/global evidence fields;
+- `employment_add_history` for contact and evidence events;
+- `employment_remove_application` with explicit confirmation and an idempotency key.
+
+The endpoint uses Supabase OAuth with PKCE and a separate account-owned Employment approval. The consent page requires an explicit choice of Inventory or Employment; client names and ordinary OAuth identity scopes never choose or broaden the data domain. Settings can revoke Employment access independently. Every tool checks that approval, and revoked, anonymous, direct browser, and other-account credentials fail closed at the MCP boundary.
+
+Mutations carry stable request IDs, sent to the life admin service as the `Idempotency-Key`. Retries preserve their original payload and ID; a changed payload cannot reuse a key. Browser edits use the same semantic operations, so an edit cannot replace the whole application list and discard a concurrent agent update. History additions preserve earlier evidence. Record only verified application and message facts; unknown roles, dates, remote eligibility, and compensation remain unknown.
+
+The scheduled Codex jobs agent owns inbox reconciliation. It reads connected recruiting sources, lists existing applications, matches source evidence, adds missing applications or history, and reads back each change. It must not mark an email processed until the record is confirmed. A job advert is a lead, an interview update is not an offer, and an unlabelled platform update must not be assigned to a specific role by guesswork. Your Life One does not ingest Gmail itself or operate a second agent scheduler.
+
+Connect the remote MCP URL `<Supabase project URL>/functions/v1/your-life-one-employment-mcp/mcp`, complete OAuth, and choose Employment on the Your Life One consent page. If that tool connection or its approval is unavailable, report the precise blocker and retain the source for reconciliation on the next run; direct database access, copied browser tokens, and UI automation remain prohibited fallbacks.
+
+## Jev voice prototype boundary
+
+The [Jev voice prototype](jev-voice-prototype.md) is a first-party browser command
+selector: Jev chooses from supplied names and IDs; the signed-in app previews and
+confirms existing planner operations. Its Edge Function exposes no external
+account read or write tools and rejects unavailable account-owned provider keys
+through the existing first-party Vault boundary. Task and Knowledge semantic
+MCP capabilities remain missing, explicitly blocking general external-agent
+acceptance. Prototype fixtures do not authorize a real account-data bypass.
+
+## Operational diagnostics boundary
+
+Operational diagnostics add no account-owned database records or business-data API. The browser keeps a redacted memory-only timeline, cleared on account change, and sends fixed metadata envelopes to the profile service's `/api/profile/v1/operational-events` collector with the user's bearer token; OAuth client tokens cannot use it as a new domain capability. Envelopes carry no account identifiers, record contents, credentials, arbitrary messages or URLs.
+
+Operators inspect retained events through the existing authenticated Supabase operational Logs interface. External agents must use that governed operator interface for operational logs; this does not authorize account SQL, copied user tokens, or business-data UI access. Debug export is a local diagnostic convenience, not an external account-data interface. The existing domain MCP approvals and missing capabilities remain unchanged.
+
+## Daily goal progress controls
+
+The Learn and Move switches only choose the amount passed to the existing first-party progress operation: the gap to the displayed level target by default, or one unit when “Add individual steps” is on. They are independent view-local controls, reset when the dashboard remounts, and add no shared data, schema, or new account operation. Progress continues through the planner service. This UI convenience does not change external agent access: Daily Learn and Move still have no published domain MCP, so external account reads and progress writes remain unavailable.
+
+## Equity MCP requirement
+
+The independent Equity domain exposes bounded list/get/add/update/remove position
+tools at `your-life-one-equity-mcp/mcp`. Updates require the current `updatedAt`;
+removal requires explicit confirmation; retryable writes carry stable UUID request
+IDs, sent to the finance service as the `Idempotency-Key`. An add without a
+position ID uses its request ID as the ID, so an exact retry names the same
+record. The function forwards the agent's OAuth token to the finance service,
+which is the system of record and refuses an unapproved client with
+`403 agent_not_approved` (shown to the agent as the OAuth challenge); the browser
+uses the same service endpoints with the user's session. Complete separate Equity
+OAuth approval before importing any private holdings. Inventory or Employment
+consent never grants equity or banking access. Personal data is not seeded from
+source code. Deployment, consent and private record readback are required for
+acceptance; see [`finance-equity.md`](finance-equity.md).
+
+## Browser page loading
+
+The Software surface is a release-owned list of published links and installed-app launch links, not an account-data feature. It adds no service records, domain reads, mutations, or external-agent capability. The Autoclicker launch URL only shows the stopped native app; it accepts no commands or parameters. The private Projects catalogue and its existing access boundary remain unchanged.
+
+Pages load from the Spring services with the user's session; the first-party generic record store (`get_yourlifeone_account_snapshot_for_collections`, `get_yourlifeone_changed_collections`, `apply_yourlifeone_mutations`) and its Broadcast were retired in v0.2.206. No external domain MCP contract changed.
+
+### Access-only MCP probes (KAN-327)
+
+Every authenticated Inventory, Employment, Finance and Equity MCP request validates the OAuth
+account and checks current domain/client approval through the provider's empty 204 access route.
+Initialization, notifications and discovery read no business data. A business tool then performs
+its normal operation once. Approval is never cached; 401/403 remain OAuth challenges, and an
+unavailable access route returns 503 without a business-read fallback. See
+[`KAN-327.md`](KAN-327.md) for exact fixture, validation and deployment boundaries.
+
+## Budget forecast
+
+The existing `finance_get_review` and `finance_save_review` tools include optional `budgetForecast: { baselineMonth, incomePence?, incomeBasis?, items: [{ id, label, amountPence, group }] }` and `transactions`. Read the current review and preserve its other fields when saving with the exact revision. Forecast income is monthly take-home salary, with its dated basis, separate from total bank receipts. Missing/null forecast income preserves stored income even when an older client replaces items; zero is explicit.
+
+Each itemised spending row has `id`, personal `accountId`, `month`, optional `date`, `merchant`, original `description`, `category`, signed `amountPence` (positive debit, negative refund), optional verified `detail`, optional `recurrence` (`recurring`, `one-off`, `unknown`), optional `sourceIds`, and `origin` (`bank`, `user`). Bank rows require a matching date and existing source; user-confirmed monthly transfers can omit an unknown posting date. Household account references, duplicate IDs, unknown sources, zero/fractional amounts and mismatched dates are rejected. Do not infer a plan/product from an opaque merchant string. Preserve original descriptions alongside receipt-confirmed purpose and source links.
+
+The bounded plan is separate from historical spending and essential-budget assumptions. Missing/null preserves the stored forecast/payment history; explicit empty arrays clear their contents. Legacy saves preserve retained evidence before validating personal-account/source references. No new scope, bank access or money movement is introduced. Shared service contracts and hosted synthetic checks cover save/readback, legacy preservation, nested salary preservation and explicit empty arrays.
+
+## Account display preferences
+
+The profile service exposes allowlisted per-key view preferences to the first-party UI. OAuth-client tokens are refused on both read and write routes until a narrow semantic get/set preference MCP capability is published. Inventory, Employment and Finance approval do not grant this boundary. External-agent acceptance is an explicit gap; use synthetic contracts for validation, never direct account API/database access, UI automation or session-token reuse. See `view-preferences.md`.
